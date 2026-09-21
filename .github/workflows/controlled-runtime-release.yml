@@ -138,9 +138,8 @@ jobs:
           for candidate in "${pkg_config_outputs[@]}"; do
             case "$candidate" in
               */bin/pkg-config-tool)
-                candidate="$(readlink -f "$candidate")"
                 if [[ -x "$candidate" ]]; then
-                  pkg_config_tool="$candidate"
+                  pkg_config_tool="$(readlink -f "$candidate")"
                   break
                 fi
                 ;;
