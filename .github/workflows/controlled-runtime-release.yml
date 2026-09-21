@@ -98,6 +98,69 @@ jobs:
             build-essential pkg-config libcap-dev libasound2-dev bubblewrap \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-tools
           gst-inspect-1.0 rtpjitterbuffer >/dev/null
+      - uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
+        with:
+          bazelisk-version: 1.28.1
+      - name: Prepare pinned voice development inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          bazel build //third_party/voice:native_sdk //third_party/voice:native_link //third_party/voice:pkg_config
+
+          sdk="$(readlink -f bazel-bin/third_party/voice/native_runtime_linux_x86_64_sdk)"
+          native_lib="$(readlink -f bazel-bin/third_party/voice/native_link_linux_x86_64/lib)"
+          pkg_config_tool="$(readlink -f bazel-bin/third_party/voice/pkg_config_unix/bin/pkg-config-tool)"
+          test -d "$sdk/lib/pkgconfig"
+          test -d "$native_lib"
+          test -x "$pkg_config_tool"
+
+          pkg_config_wrapper="$RUNNER_TEMP/voice-pkg-config"
+          cat >"$pkg_config_wrapper" <<EOF
+          #!/bin/sh
+          case " \$* " in
+            *" glib-2.0 "*|*" gobject-2.0 "*|*" gio-2.0 "*|*" gmodule-no-export-2.0 "*|*" gstreamer-1.0 "*|*" gstreamer-base-1.0 "*|*" gstreamer-app-1.0 "*|*" gstreamer-audio-1.0 "*|*" gstreamer-tag-1.0 "*)
+              PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$sdk/lib/pkgconfig" \
+                exec "$pkg_config_tool" --define-prefix "\$@"
+              ;;
+            *)
+              unset PKG_CONFIG_LIBDIR PKG_CONFIG_PATH
+              exec /usr/bin/pkg-config "\$@"
+              ;;
+          esac
+          EOF
+          chmod 0755 "$pkg_config_wrapper"
+
+          export PKG_CONFIG="$pkg_config_wrapper"
+          "$PKG_CONFIG" --atleast-version=1.28 gstreamer-1.0
+          "$PKG_CONFIG" --atleast-version=1.28 gstreamer-app-1.0 gstreamer-audio-1.0
+          "$PKG_CONFIG" --cflags --libs gstreamer-app-1.0 gstreamer-audio-1.0 |
+            grep -F -- "-I$sdk/include" >/dev/null
+          "$PKG_CONFIG" --cflags --libs gstreamer-app-1.0 gstreamer-audio-1.0 |
+            grep -F -- "-L$sdk/lib" >/dev/null
+
+          cat >"$RUNNER_TEMP/voice-sdk-probe.c" <<'EOF'
+          #include <gst/gst.h>
+          int main(int argc, char **argv) {
+              gst_init(&argc, &argv);
+              return gst_version_string() == NULL;
+          }
+          EOF
+          # shellcheck disable=SC2046
+          cc "$RUNNER_TEMP/voice-sdk-probe.c" -o "$RUNNER_TEMP/voice-sdk-probe" \
+            $("$PKG_CONFIG" --cflags --libs gstreamer-1.0)
+          LD_LIBRARY_PATH="$native_lib" "$RUNNER_TEMP/voice-sdk-probe"
+
+          {
+            echo "PKG_CONFIG=$PKG_CONFIG"
+            echo "LD_LIBRARY_PATH=$native_lib"
+            echo "GST_PLUGIN_PATH=$native_lib/gstreamer-1.0"
+            for key in GLIB_2_0 GOBJECT_2_0 GIO_2_0 GSTREAMER_1_0 GSTREAMER_BASE_1_0 GSTREAMER_APP_1_0 GSTREAMER_AUDIO_1_0; do
+              echo "SYSTEM_DEPS_${key}_SEARCH_NATIVE=$native_lib"
+            done
+            for key in GSTREAMER_1_0 GSTREAMER_BASE_1_0 GSTREAMER_APP_1_0 GSTREAMER_AUDIO_1_0; do
+              echo "SYSTEM_DEPS_${key}_LDFLAGS="
+            done
+          } >> "$GITHUB_ENV"
       - name: Build integration executables
         working-directory: codex-rs
         run: cargo build --locked -p codex-rmcp-client --bin test_stdio_server -p codex-code-mode-host --bin codex-code-mode-host -p codex-bwrap --bin bwrap -p codex-cli --bin codex
