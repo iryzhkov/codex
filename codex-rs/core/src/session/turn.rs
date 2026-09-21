@@ -2454,9 +2454,9 @@ async fn drain_in_flight(
                             ))
                         })?
                         .len();
-                    bounded.admit_tool_result(serialized_len).map_err(|error| {
-                        CodexErr::Fatal(format!("{}: {error}", error.code()))
-                    })?;
+                    bounded
+                        .admit_tool_result(serialized_len)
+                        .map_err(|error| CodexErr::Fatal(format!("{}: {error}", error.code())))?;
                 }
                 mark_thread_memory_mode_polluted_if_external_context(
                     sess.as_ref(),

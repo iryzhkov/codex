@@ -1,0 +1,206 @@
+#![cfg(target_os = "linux")]
+
+use anyhow::Result;
+use codex_core::TurnInputRequest;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::user_input::UserInput;
+use core_test_support::responses::ev_assistant_message;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_function_call;
+use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_sse_sequence;
+use core_test_support::responses::sse;
+use core_test_support::responses::start_mock_server;
+use core_test_support::test_codex::test_codex;
+use core_test_support::wait_for_event;
+use serde_json::Value;
+use serde_json::json;
+use serial_test::serial;
+use sha2::Digest;
+use sha2::Sha256;
+use std::ffi::OsStr;
+use std::ffi::OsString;
+
+const ENV_KEYS: [&str; 5] = [
+    "CODEX_BOUNDED_READ_MANIFEST",
+    "CODEX_BOUNDED_READ_MANIFEST_SHA256",
+    "CODEX_BOUNDED_READ_REQUEST_ID",
+    "CODEX_BOUNDED_READ_PROJECT_ID",
+    "CODEX_BOUNDED_READ_REVISION",
+];
+
+struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
+
+impl EnvGuard {
+    fn set(values: [(&'static str, &OsStr); 5]) -> Self {
+        let old = values
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect();
+        for (key, value) in values {
+            unsafe { std::env::set_var(key, value) };
+        }
+        Self(old)
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.0.drain(..) {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn custody_env(dir: &tempfile::TempDir, artifact_id: &str, content: &[u8]) -> EnvGuard {
+    let artifact = dir.path().join("artifact.txt");
+    std::fs::write(&artifact, content).unwrap();
+    let manifest = serde_json::to_vec(&json!({
+        "schema": "bounded-read-v1",
+        "request_id": "request",
+        "project_id": "project",
+        "revision": "revision",
+        "entries": [{
+            "artifact_id": artifact_id,
+            "path": "artifact.txt",
+            "sha256": sha256(content),
+            "size": content.len(),
+            "media_type": "text/plain"
+        }]
+    }))
+    .unwrap();
+    let manifest_path = dir.path().join("manifest.json");
+    std::fs::write(&manifest_path, &manifest).unwrap();
+    let digest = sha256(&manifest);
+    EnvGuard::set([
+        (ENV_KEYS[0], manifest_path.as_os_str()),
+        (ENV_KEYS[1], OsStr::new(&digest)),
+        (ENV_KEYS[2], OsStr::new("request")),
+        (ENV_KEYS[3], OsStr::new("project")),
+        (ENV_KEYS[4], OsStr::new("revision")),
+    ])
+}
+
+fn tool_names(body: &Value) -> Vec<&str> {
+    body["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(bounded_read_env)]
+async fn bounded_read_performs_exactly_two_posts_with_one_custody_tool() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let artifact_id = "artifact";
+    let _env = custody_env(&dir, artifact_id, b"custodied evidence");
+
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(
+                    "read-1",
+                    "read_custodied_page",
+                    &json!({"artifact_id": artifact_id, "cursor": null}).to_string(),
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-2", "done"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    let fixture = test_codex().with_model("gpt-5.4").build(&server).await?;
+    fixture
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "consult the custodied artifact".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let terminal = wait_for_event(&fixture.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_) | EventMsg::Error(_))
+    })
+    .await;
+    assert!(
+        matches!(terminal, EventMsg::TurnComplete(_)),
+        "unexpected terminal: {terminal:?}"
+    );
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_eq!(
+            tool_names(&request.body_json()),
+            vec!["read_custodied_page"]
+        );
+        assert_eq!(request.body_json()["parallel_tool_calls"], false);
+    }
+    let second = requests[1].body_json().to_string();
+    assert!(second.contains("custodied evidence") || second.contains("Y3VzdG9kaWVkIGV2aWRlbmNl"));
+    assert!(second.contains(artifact_id));
+    assert!(!second.contains("artifact.txt"));
+    assert!(!second.contains("manifest.json"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(bounded_read_env)]
+async fn oversized_serialized_tool_output_stops_before_second_post() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let artifact_id = "a".repeat(128);
+    let _env = custody_env(&dir, &artifact_id, &[b'x'; 1024]);
+
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("resp-1"),
+            ev_function_call(
+                "read-1",
+                "read_custodied_page",
+                &json!({"artifact_id": artifact_id, "cursor": null}).to_string(),
+            ),
+            ev_completed("resp-1"),
+        ])],
+    )
+    .await;
+
+    let fixture = test_codex().with_model("gpt-5.4").build(&server).await?;
+    fixture
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "read".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let terminal = wait_for_event(&fixture.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_) | EventMsg::Error(_))
+    })
+    .await;
+    assert!(
+        matches!(terminal, EventMsg::Error(_)),
+        "unexpected terminal: {terminal:?}"
+    );
+    assert!(format!("{terminal:?}").contains("budget-exhausted"));
+    assert_eq!(responses.requests().len(), 1);
+    Ok(())
+}

@@ -257,7 +257,8 @@ struct ModelClientState {
     disable_websockets: AtomicBool,
     controlled_response_config: ControlledResponseConfig,
     controlled_response_submitted: AtomicBool,
-    bounded_read_session: std::result::Result<Option<Arc<crate::bounded_read::BoundedReadSession>>, String>,
+    bounded_read_session:
+        std::result::Result<Option<Arc<crate::bounded_read::BoundedReadSession>>, String>,
     agent_identity_session_fallback: AgentIdentitySessionFallback,
     cached_websocket_session: StdMutex<WebsocketSession>,
 }
@@ -511,12 +512,15 @@ impl ModelClient {
         let controlled_response_config = ControlledResponseConfig::from_env();
         let mut bounded_read_session =
             crate::bounded_read::BoundedReadSession::from_env().map_err(|error| error.to_string());
-        if !matches!(controlled_response_config, ControlledResponseConfig::Disabled)
-            && matches!(bounded_read_session, Ok(Some(_)))
+        if !matches!(
+            controlled_response_config,
+            ControlledResponseConfig::Disabled
+        ) && matches!(bounded_read_session, Ok(Some(_)))
         {
-            bounded_read_session =
-                Err("one-shot controlled response and bounded read modes are mutually exclusive"
-                    .to_string());
+            bounded_read_session = Err(
+                "one-shot controlled response and bounded read modes are mutually exclusive"
+                    .to_string(),
+            );
         }
         Self {
             state: Arc::new(ModelClientState {
@@ -1357,11 +1361,12 @@ impl ModelClientSession {
         use_responses_lite: bool,
         request_kind: Option<CodexResponsesRequestKind>,
     ) -> Result<Option<usize>> {
-        if let Some(bounded) = self
-            .client
-            .bounded_read_session()
-            .map_err(|message| self.client.state.provider.map_api_error(ApiError::Stream(message)))?
-        {
+        if let Some(bounded) = self.client.bounded_read_session().map_err(|message| {
+            self.client
+                .state
+                .provider
+                .map_api_error(ApiError::Stream(message))
+        })? {
             if !matches!(self.client.state.session_source, SessionSource::Exec)
                 || model_info.used_fallback_model_metadata
                 || request.model != model_info.slug
@@ -1394,17 +1399,20 @@ impl ModelClientSession {
             request.parallel_tool_calls = false;
             request.max_output_tokens = Some(crate::bounded_read::MAX_OUTPUT_TOKENS);
             let encoded = serde_json::to_vec(request).map_err(|error| {
-                self.client.state.provider.map_api_error(ApiError::Stream(format!(
-                    "failed to encode bounded read request: {error}"
-                )))
+                self.client
+                    .state
+                    .provider
+                    .map_api_error(ApiError::Stream(format!(
+                        "failed to encode bounded read request: {error}"
+                    )))
             })?;
             bounded
                 .admit_provider_request(encoded.len(), context_window)
                 .map_err(|error| {
-                    self.client.state.provider.map_api_error(ApiError::Stream(format!(
-                        "{}: {error}",
-                        error.code()
-                    )))
+                    self.client
+                        .state
+                        .provider
+                        .map_api_error(ApiError::Stream(format!("{}: {error}", error.code())))
                 })?;
             return Ok(Some(encoded.len()));
         }
@@ -1882,6 +1890,7 @@ impl ModelClientSession {
                 .with_endpoint(endpoint)
                 .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
             let stream_result = client.stream_request(request, options).await;
+            let bounded_request = matches!(&self.client.state.bounded_read_session, Ok(Some(_)));
 
             match stream_result {
                 Ok(stream) => {
@@ -1894,11 +1903,12 @@ impl ModelClientSession {
                     return Ok(stream);
                 }
                 Err(ApiError::Transport(unauthorized_transport))
-                    if self
-                        .client
-                        .state
-                        .provider
-                        .is_recoverable_auth_error(&unauthorized_transport) =>
+                    if !bounded_request
+                        && self
+                            .client
+                            .state
+                            .provider
+                            .is_recoverable_auth_error(&unauthorized_transport) =>
                 {
                     let response_debug_context =
                         extract_response_debug_context(&unauthorized_transport);
@@ -1924,7 +1934,14 @@ impl ModelClientSession {
                 Err(err) => {
                     let response_debug_context =
                         extract_response_debug_context_from_api_error(&err);
-                    let err = self.client.state.provider.map_api_error(err);
+                    let err = if bounded_request && matches!(err, ApiError::Transport(_)) {
+                        self.client.state.provider.map_api_error(ApiError::Stream(
+                            "recovery-required: bounded read transport outcome is ambiguous"
+                                .to_string(),
+                        ))
+                    } else {
+                        self.client.state.provider.map_api_error(err)
+                    };
                     inference_trace_attempt.record_failed(
                         &err,
                         response_debug_context.request_id.as_deref(),

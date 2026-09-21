@@ -103,8 +103,7 @@ pub(crate) struct ReadPage {
     pub(crate) end: bool,
 }
 
-#[derive(Default)]
-#[derive(Debug)]
+#[derive(Default, Debug)]
 struct Admission {
     provider_requests: u8,
     provider_bytes: usize,
@@ -114,8 +113,7 @@ struct Admission {
     consumed_cursors: HashSet<String>,
 }
 
-#[derive(Clone)]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Cursor {
     artifact_id: String,
     offset: u64,
@@ -183,8 +181,8 @@ impl BoundedReadSession {
         if sha256_hex(&bytes) != expected_digest {
             return Err(invalid("manifest digest mismatch"));
         }
-        let manifest: Manifest =
-            serde_json::from_slice(&bytes).map_err(|error| invalid(format!("manifest JSON: {error}")))?;
+        let manifest: Manifest = serde_json::from_slice(&bytes)
+            .map_err(|error| invalid(format!("manifest JSON: {error}")))?;
         if manifest.schema != "bounded-read-v1"
             || manifest.request_id != request_id
             || manifest.project_id != project_id
@@ -246,7 +244,10 @@ impl BoundedReadSession {
         let offset = match cursor {
             None => 0,
             Some(token) => {
-                let mut state = self.admission.lock().map_err(|_| invalid("admission lock poisoned"))?;
+                let mut state = self
+                    .admission
+                    .lock()
+                    .map_err(|_| invalid("admission lock poisoned"))?;
                 if state.consumed_cursors.contains(token) {
                     return Err(invalid("stale cursor"));
                 }
@@ -268,7 +269,9 @@ impl BoundedReadSession {
         let amount = usize::try_from(remaining.min(MAX_PAGE_CONTENT_BYTES as u64))
             .map_err(|_| invalid("page size conversion"))?;
         let start = usize::try_from(offset).map_err(|_| invalid("page offset conversion"))?;
-        let end = start.checked_add(amount).ok_or_else(|| invalid("page range overflow"))?;
+        let end = start
+            .checked_add(amount)
+            .ok_or_else(|| invalid("page range overflow"))?;
         let content = entry
             .content
             .get(start..end)
@@ -281,7 +284,10 @@ impl BoundedReadSession {
             None
         } else {
             let token = self.cursor_token(artifact_id, end_offset);
-            let mut state = self.admission.lock().map_err(|_| invalid("admission lock poisoned"))?;
+            let mut state = self
+                .admission
+                .lock()
+                .map_err(|_| invalid("admission lock poisoned"))?;
             state.issued_cursors.insert(
                 token.clone(),
                 Cursor {
@@ -307,8 +313,14 @@ impl BoundedReadSession {
         if serialized_len > MAX_TOOL_RESULT_BYTES {
             return Err(BoundedReadError::BudgetExhausted);
         }
-        let mut state = self.admission.lock().map_err(|_| invalid("admission lock poisoned"))?;
-        let pages = state.pages.checked_add(1).ok_or(BoundedReadError::BudgetExhausted)?;
+        let mut state = self
+            .admission
+            .lock()
+            .map_err(|_| invalid("admission lock poisoned"))?;
+        let pages = state
+            .pages
+            .checked_add(1)
+            .ok_or(BoundedReadError::BudgetExhausted)?;
         let total = state
             .tool_bytes
             .checked_add(serialized_len)
@@ -335,7 +347,10 @@ impl BoundedReadSession {
         if serialized_len > MAX_PROVIDER_REQUEST_BYTES || reserved > verified_context_window {
             return Err(BoundedReadError::ContextTooLarge);
         }
-        let mut state = self.admission.lock().map_err(|_| invalid("admission lock poisoned"))?;
+        let mut state = self
+            .admission
+            .lock()
+            .map_err(|_| invalid("admission lock poisoned"))?;
         let requests = state
             .provider_requests
             .checked_add(1)
@@ -437,14 +452,18 @@ impl ToolExecutor<ToolInvocation> for BoundedReadHandler {
                 ));
             };
             let args: ReadPageArgs = serde_json::from_str(&arguments).map_err(|error| {
-                FunctionCallError::Fatal(format!("invalid-custody: invalid bounded read arguments: {error}"))
+                FunctionCallError::Fatal(format!(
+                    "invalid-custody: invalid bounded read arguments: {error}"
+                ))
             })?;
             let page = self
                 .session
                 .read_page(&args.artifact_id, args.cursor.as_deref())
                 .map_err(|error| FunctionCallError::Fatal(format!("{}: {error}", error.code())))?;
             let output = serde_json::to_string(&page).map_err(|error| {
-                FunctionCallError::Fatal(format!("invalid-custody: failed to serialize page: {error}"))
+                FunctionCallError::Fatal(format!(
+                    "invalid-custody: failed to serialize page: {error}"
+                ))
             })?;
             Ok(boxed_tool_output(FunctionToolOutput::from_text(
                 output,
@@ -499,10 +518,7 @@ fn validate_relative_path(value: &str) -> Result<(), BoundedReadError> {
     Ok(())
 }
 
-fn read_verified_artifact(
-    root: &File,
-    entry: &ManifestEntry,
-) -> Result<Vec<u8>, BoundedReadError> {
+fn read_verified_artifact(root: &File, entry: &ManifestEntry) -> Result<Vec<u8>, BoundedReadError> {
     let file = open_relative(root, Path::new(&entry.path), false)?;
     let metadata = file
         .metadata()
@@ -564,7 +580,10 @@ fn open_os_root() -> Result<File, BoundedReadError> {
         )
     };
     if fd < 0 {
-        return Err(invalid(format!("open custody root: {}", std::io::Error::last_os_error())));
+        return Err(invalid(format!(
+            "open custody root: {}",
+            std::io::Error::last_os_error()
+        )));
     }
     Ok(unsafe { File::from_raw_fd(fd) })
 }
@@ -592,7 +611,7 @@ fn open_relative(root: &File, path: &Path, directory: bool) -> Result<File, Boun
 
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| invalid("custody path contains NUL"))?;
-    let mut flags = (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+    let mut flags = (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK) as u64;
     if directory {
         flags |= libc::O_DIRECTORY as u64;
     }
@@ -611,7 +630,10 @@ fn open_relative(root: &File, path: &Path, directory: bool) -> Result<File, Boun
         )
     } as libc::c_int;
     if fd < 0 {
-        return Err(invalid(format!("rooted custody open: {}", std::io::Error::last_os_error())));
+        return Err(invalid(format!(
+            "rooted custody open: {}",
+            std::io::Error::last_os_error()
+        )));
     }
     Ok(unsafe { File::from_raw_fd(fd) })
 }
@@ -637,13 +659,16 @@ fn open_relative(root: &File, path: &Path, directory: bool) -> Result<File, Boun
         let name = std::ffi::CString::new(name.as_bytes())
             .map_err(|_| invalid("custody path contains NUL"))?;
         let last = index + 1 == components.len();
-        let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
         if !last || directory {
             flags |= libc::O_DIRECTORY;
         }
         let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
         if fd < 0 {
-            return Err(invalid(format!("rooted custody open: {}", std::io::Error::last_os_error())));
+            return Err(invalid(format!(
+                "rooted custody open: {}",
+                std::io::Error::last_os_error()
+            )));
         }
         current = unsafe { File::from_raw_fd(fd) };
     }
@@ -652,11 +677,17 @@ fn open_relative(root: &File, path: &Path, directory: bool) -> Result<File, Boun
 
 #[cfg(not(unix))]
 fn open_relative(_root: &File, _path: &Path, _directory: bool) -> Result<File, BoundedReadError> {
-    Err(invalid("rooted custody reads are unsupported on this platform"))
+    Err(invalid(
+        "rooted custody reads are unsupported on this platform",
+    ))
 }
 
 fn validate_digest(value: &str) -> Result<(), BoundedReadError> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         return Err(invalid("digest must be lowercase SHA-256"));
     }
     Ok(())
@@ -751,9 +782,11 @@ mod tests {
 
         let (_dir, session) = fixture();
         for _ in 0..MAX_PROVIDER_REQUESTS {
-            assert!(session
-                .admit_provider_request(MAX_PROVIDER_REQUEST_BYTES, 100_000)
-                .is_ok());
+            assert!(
+                session
+                    .admit_provider_request(MAX_PROVIDER_REQUEST_BYTES, 100_000)
+                    .is_ok()
+            );
         }
         assert_eq!(
             session
@@ -783,15 +816,17 @@ mod tests {
         let (dir, _session) = fixture();
         let manifest_path = dir.path().join("manifest.json");
         let bytes = std::fs::read(&manifest_path).unwrap();
-        assert!(BoundedReadSession::load(
-            &manifest_path,
-            &"0".repeat(64),
-            "request".into(),
-            "project".into(),
-            "revision".into(),
-            Instant::now(),
-        )
-        .is_err());
+        assert!(
+            BoundedReadSession::load(
+                &manifest_path,
+                &"0".repeat(64),
+                "request".into(),
+                "project".into(),
+                "revision".into(),
+                Instant::now(),
+            )
+            .is_err()
+        );
 
         let bad = |entry: serde_json::Value| {
             let manifest = json!({
@@ -821,13 +856,17 @@ mod tests {
             "artifact_id": "artifact", "path": "artifact.txt", "sha256": sha256_hex(&vec![b'x'; 3_100]),
             "size": 3_100, "media_type": "text/plain"
         });
-        assert!(bad(json!([valid.clone(), valid.clone()])).is_err());
+        assert!(bad(json!([valid.clone(), valid])).is_err());
         let same_path = json!({
             "artifact_id": "second", "path": "artifact.txt", "sha256": sha256_hex(&vec![b'x'; 3_100]),
             "size": 3_100, "media_type": "text/plain"
         });
         assert!(bad(json!([valid, same_path])).is_err());
-        for (id, path) in [("bad id", "artifact.txt"), ("safe", "dir//artifact.txt"), ("safe", "dir/./artifact.txt")] {
+        for (id, path) in [
+            ("bad id", "artifact.txt"),
+            ("safe", "dir//artifact.txt"),
+            ("safe", "dir/./artifact.txt"),
+        ] {
             let entry = json!({
                 "artifact_id": id, "path": path, "sha256": "0".repeat(64),
                 "size": 0, "media_type": "text/plain"
@@ -866,19 +905,28 @@ mod tests {
             let bytes = serde_json::to_vec(&json!({
                 "schema": "bounded-read-v1", "request_id": "request",
                 "project_id": "project", "revision": "revision", "entries": entries
-            })).unwrap();
+            }))
+            .unwrap();
             std::fs::write(&path, &bytes).unwrap();
             BoundedReadSession::load(
-                &path, &sha256_hex(&bytes), "request".into(), "project".into(),
-                "revision".into(), Instant::now(),
+                &path,
+                &sha256_hex(&bytes),
+                "request".into(),
+                "project".into(),
+                "revision".into(),
+                Instant::now(),
             )
         };
-        let entry = |index: usize, size: u64| json!({
-            "artifact_id": format!("a{index}"), "path": format!("missing{index}"),
-            "sha256": "0".repeat(64), "size": size, "media_type": "text/plain"
-        });
-        assert!(load((0..=MAX_ARTIFACTS).map(|i| entry(i, 0)).collect()).is_err());
-        assert!(load((0..5).map(|i| entry(i, MAX_ARTIFACT_BYTES)).collect()).is_err());
+        let entry = |index: usize, size: u64| {
+            json!({
+                "artifact_id": format!("a{index}"), "path": format!("missing{index}"),
+                "sha256": "0".repeat(64), "size": size, "media_type": "text/plain"
+            })
+        };
+        let too_many = load((0..=MAX_ARTIFACTS).map(|i| entry(i, 0)).collect()).unwrap_err();
+        assert!(too_many.to_string().contains("too many artifacts"));
+        let too_large = load((0..5).map(|i| entry(i, MAX_ARTIFACT_BYTES)).collect()).unwrap_err();
+        assert!(too_large.to_string().contains("aggregate artifact size"));
     }
 
     #[cfg(unix)]
@@ -899,10 +947,53 @@ mod tests {
         let bytes = serde_json::to_vec(&manifest).unwrap();
         let path = dir.path().join("manifest.json");
         std::fs::write(&path, &bytes).unwrap();
-        assert!(BoundedReadSession::load(
-            &path, &sha256_hex(&bytes), "request".into(), "project".into(),
-            "revision".into(), Instant::now(),
-        ).is_err());
+        assert!(
+            BoundedReadSession::load(
+                &path,
+                &sha256_hex(&bytes),
+                "request".into(),
+                "project".into(),
+                "revision".into(),
+                Instant::now(),
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rooted_open_rejects_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("artifact.pipe");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let manifest = json!({
+            "schema": "bounded-read-v1", "request_id": "request",
+            "project_id": "project", "revision": "revision", "entries": [{
+                "artifact_id": "artifact", "path": "artifact.pipe",
+                "sha256": "0".repeat(64), "size": 1, "media_type": "text/plain"
+            }]
+        });
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, &bytes).unwrap();
+        let started = Instant::now();
+        let error = BoundedReadSession::load(
+            &path,
+            &sha256_hex(&bytes),
+            "request".into(),
+            "project".into(),
+            "revision".into(),
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            error.to_string().contains("not a declared regular file"),
+            "unexpected FIFO error: {error}"
+        );
     }
 
     #[test]
@@ -924,7 +1015,10 @@ mod tests {
             "deadline-exceeded"
         );
         assert_eq!(
-            session.admit_provider_request(1, 100_000).unwrap_err().code(),
+            session
+                .admit_provider_request(1, 100_000)
+                .unwrap_err()
+                .code(),
             "deadline-exceeded"
         );
     }
