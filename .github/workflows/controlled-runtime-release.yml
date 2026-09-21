@@ -142,18 +142,31 @@ jobs:
           #include <gst/gst.h>
           int main(int argc, char **argv) {
               gst_init(&argc, &argv);
-              return gst_version_string() == NULL;
+              guint major, minor, micro, nano;
+              gst_version(&major, &minor, &micro, &nano);
+              if (major != GST_VERSION_MAJOR || minor != GST_VERSION_MINOR || micro != GST_VERSION_MICRO)
+                  return 1;
+              GstElementFactory *factory = gst_element_factory_find("rtpjitterbuffer");
+              if (factory == NULL)
+                  return 2;
+              gst_object_unref(factory);
+              return 0;
           }
           EOF
           # shellcheck disable=SC2046
           cc "$RUNNER_TEMP/voice-sdk-probe.c" -o "$RUNNER_TEMP/voice-sdk-probe" \
             $("$PKG_CONFIG" --cflags --libs gstreamer-1.0)
+          export GST_PLUGIN_PATH="$native_lib/gstreamer-1.0"
+          export GST_PLUGIN_SYSTEM_PATH=
+          export GST_REGISTRY="$RUNNER_TEMP/voice-sdk-registry.bin"
           LD_LIBRARY_PATH="$native_lib" "$RUNNER_TEMP/voice-sdk-probe"
 
           {
             echo "PKG_CONFIG=$PKG_CONFIG"
             echo "LD_LIBRARY_PATH=$native_lib"
-            echo "GST_PLUGIN_PATH=$native_lib/gstreamer-1.0"
+            echo "GST_PLUGIN_PATH=$GST_PLUGIN_PATH"
+            echo "GST_PLUGIN_SYSTEM_PATH=$GST_PLUGIN_SYSTEM_PATH"
+            echo "GST_REGISTRY=$GST_REGISTRY"
             for key in GLIB_2_0 GOBJECT_2_0 GIO_2_0 GSTREAMER_1_0 GSTREAMER_BASE_1_0 GSTREAMER_APP_1_0 GSTREAMER_AUDIO_1_0; do
               echo "SYSTEM_DEPS_${key}_SEARCH_NATIVE=$native_lib"
             done
