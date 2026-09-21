@@ -1185,6 +1185,8 @@ async fn sandbox_keeps_parent_repo_discovery_while_blocking_child_metadata() {
         "git init should create parent repo"
     );
 
+    let fixture_root =
+        AbsolutePathBuf::try_from(tmpdir.path()).expect("fixture root should be absolute");
     let repo = repo.to_string_lossy();
     let redirected_tmp = redirected_tmp.to_string_lossy();
     let script = format!(
@@ -1211,8 +1213,12 @@ fi
     );
 
     let cwd = AbsolutePathBuf::try_from(subdir.as_path()).expect("cwd should be absolute");
+    // The attack fixture writes a synthetic registry and replaces the TMPDIR symlink.
+    // Declare its root writable instead of relying on tempfile's ambient base directory
+    // also being covered by the sandbox's /tmp allowance.
+    let writable_roots = [cwd.clone(), fixture_root];
     let permission_profile = PermissionProfile::workspace_write_with(
-        std::slice::from_ref(&cwd),
+        &writable_roots,
         NetworkSandboxPolicy::Enabled,
         /*exclude_tmpdir_env_var*/ false,
         /*exclude_slash_tmp*/ false,
