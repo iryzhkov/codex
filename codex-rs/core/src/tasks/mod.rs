@@ -834,13 +834,8 @@ impl Session {
                 time_to_first_token_ms,
             })
         };
-        self.send_event(turn_context.as_ref(), event).await;
-        codex_guardian_reviewer::ReviewDenials::clear_turn(
-            &self.services.thread_extension_data,
-            &turn_context.sub_id,
-        )
-        .await;
-
+        // A terminal event is the client-visible barrier after which operations that
+        // require an idle thread, such as rollback, must be accepted.
         let cleared_active_turn = {
             let mut active = self.active_turn.lock().await;
             if let Some(active_turn) = active.as_ref()
@@ -853,6 +848,13 @@ impl Session {
                 false
             }
         };
+        self.send_event(turn_context.as_ref(), event).await;
+        codex_guardian_reviewer::ReviewDenials::clear_turn(
+            &self.services.thread_extension_data,
+            &turn_context.sub_id,
+        )
+        .await;
+
         if cleared_active_turn {
             self.emit_thread_idle_lifecycle_if_idle(idle_cause).await;
         }
