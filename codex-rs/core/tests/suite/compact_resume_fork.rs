@@ -36,7 +36,6 @@ use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
-use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
@@ -623,7 +622,10 @@ async fn snapshot_rollback_followup_turn_trims_context_updates() -> Result<()> {
                 ev_assistant_message("m2", "turn 2 assistant"),
                 ev_completed("r2"),
             ]),
-            sse(vec![ev_response_created("r3"), ev_completed("r3")]),
+            sse(vec![
+                ev_assistant_message("m3", "follow-up assistant"),
+                ev_completed("r3"),
+            ]),
         ],
     )
     .await;

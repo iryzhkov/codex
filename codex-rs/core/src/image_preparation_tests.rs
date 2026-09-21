@@ -102,70 +102,91 @@ fn preparation_preserves_small_image_bytes_and_replaces_remote_urls() {
     );
 }
 
+fn assert_detail_policy(
+    detail: Option<ImageDetail>,
+    effective_detail: ImageDetailSetting,
+    input_dimensions: (u32, u32),
+    expected_dimensions: (u32, u32),
+) {
+    let (image_url, _) = png_data_url(input_dimensions.0, input_dimensions.1);
+    let mut items = vec![ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputImage { image_url, detail }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }];
+
+    let metadata = prepare_response_items(
+        &mut items,
+        ImagePreparationMode::DetailBased,
+        ImageResizeNoticeMode::Disabled,
+    );
+
+    let ResponseItem::Message { content, .. } = &items[0] else {
+        panic!("expected message");
+    };
+    let [ContentItem::InputImage { image_url, .. }] = content.as_slice() else {
+        panic!("expected image");
+    };
+    assert_eq!(decoded_image(image_url).1.dimensions(), expected_dimensions);
+    assert_eq!(
+        metadata,
+        vec![ImagePreparationMetadata {
+            message_role: Some("user".to_string()),
+            item_id: None,
+            effective_detail,
+            source_width: input_dimensions.0,
+            source_height: input_dimensions.1,
+            prepared_width: expected_dimensions.0,
+            prepared_height: expected_dimensions.1,
+        }]
+    );
+}
+
 #[test]
-fn detail_policies_apply_the_expected_budgets() {
-    for (detail, effective_detail, input_dimensions, expected_dimensions) in [
-        (
-            Some(ImageDetail::High),
-            ImageDetailSetting::High,
-            (2048, 2048),
-            (1600, 1600),
-        ),
-        (
-            Some(ImageDetail::Original),
-            ImageDetailSetting::Original,
-            (6401, 100),
-            (6000, 94),
-        ),
-        (
-            Some(ImageDetail::Original),
-            ImageDetailSetting::Original,
-            (3201, 3201),
-            (3200, 3200),
-        ),
-        (
-            Some(ImageDetail::Auto),
-            ImageDetailSetting::High,
-            (2048, 2048),
-            (1600, 1600),
-        ),
-        (None, ImageDetailSetting::High, (2048, 2048), (1600, 1600)),
-    ] {
-        let (image_url, _) = png_data_url(input_dimensions.0, input_dimensions.1);
-        let mut items = vec![ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputImage { image_url, detail }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        }];
+fn high_detail_applies_expected_budget() {
+    assert_detail_policy(
+        Some(ImageDetail::High),
+        ImageDetailSetting::High,
+        (2048, 2048),
+        (1600, 1600),
+    );
+}
 
-        let metadata = prepare_response_items(
-            &mut items,
-            ImagePreparationMode::DetailBased,
-            ImageResizeNoticeMode::Disabled,
-        );
+#[test]
+fn original_detail_caps_long_edge() {
+    assert_detail_policy(
+        Some(ImageDetail::Original),
+        ImageDetailSetting::Original,
+        (6401, 100),
+        (6000, 94),
+    );
+}
 
-        let ResponseItem::Message { content, .. } = &items[0] else {
-            panic!("expected message");
-        };
-        let [ContentItem::InputImage { image_url, .. }] = content.as_slice() else {
-            panic!("expected image");
-        };
-        assert_eq!(decoded_image(image_url).1.dimensions(), expected_dimensions);
-        assert_eq!(
-            metadata,
-            vec![ImagePreparationMetadata {
-                message_role: Some("user".to_string()),
-                item_id: None,
-                effective_detail,
-                source_width: input_dimensions.0,
-                source_height: input_dimensions.1,
-                prepared_width: expected_dimensions.0,
-                prepared_height: expected_dimensions.1,
-            }]
-        );
-    }
+#[test]
+fn original_detail_caps_total_pixels() {
+    assert_detail_policy(
+        Some(ImageDetail::Original),
+        ImageDetailSetting::Original,
+        (3201, 3201),
+        (3200, 3200),
+    );
+}
+
+#[test]
+fn auto_detail_uses_high_budget() {
+    assert_detail_policy(
+        Some(ImageDetail::Auto),
+        ImageDetailSetting::High,
+        (2048, 2048),
+        (1600, 1600),
+    );
+}
+
+#[test]
+fn missing_detail_uses_high_budget() {
+    assert_detail_policy(None, ImageDetailSetting::High, (2048, 2048), (1600, 1600));
 }
 
 #[test]

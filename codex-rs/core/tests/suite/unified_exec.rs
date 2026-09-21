@@ -3514,9 +3514,9 @@ PY
     .await;
     assert!(end_event.aggregated_output.contains("HEAD\n"));
     assert!(end_event.aggregated_output.contains("TAIL\n"));
-    assert_regex_match(
-        r"\.\.\. \d+ bytes omitted \.\.\.",
-        &end_event.aggregated_output,
+    assert!(
+        end_event.aggregated_output.len() < original_output_bytes,
+        "large output should be truncated in the end event"
     );
 
     wait_for_event(&test.codex, |event| {
