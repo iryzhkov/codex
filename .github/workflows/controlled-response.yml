@@ -47,10 +47,10 @@ jobs:
         run: cargo build --locked -p codex-rmcp-client --bin test_stdio_server -p codex-code-mode-host --bin codex-code-mode-host -p codex-bwrap --bin bwrap
       - name: Check Rust formatting
         run: cargo fmt -- --config imports_granularity=Item --check
+      - name: Build the executable required by integration tests
+        run: cargo build --locked -p codex-cli --bin codex
       - name: Test affected crates including opt-out behavior
         run: just test --locked -p codex-core -p codex-api
-      - name: Build the qualified executable
-        run: cargo build --locked -p codex-cli --bin codex
       - name: Record executable identity
         run: |
           git rev-parse HEAD
