@@ -22,7 +22,12 @@ struct TestDaemon {
 
 impl TestDaemon {
     fn new() -> Result<Self> {
-        let home = tempfile::Builder::new().tempdir_in("/tmp")?;
+        // macOS temporary paths can exceed the Unix socket path limit.
+        let home = if cfg!(target_os = "macos") {
+            tempfile::Builder::new().tempdir_in("/tmp")?
+        } else {
+            tempfile::tempdir()?
+        };
         let codex = codex_utils_cargo_bin::cargo_bin("codex")?;
         let codex_source = std::fs::canonicalize(&codex)?;
         let target = if cfg!(target_os = "macos") {
