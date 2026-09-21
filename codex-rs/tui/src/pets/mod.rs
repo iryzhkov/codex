@@ -346,9 +346,14 @@ mod tests {
 
     #[test]
     fn kitty_local_file_pet_image_uses_file_reference_without_inline_payload() {
+        use base64::Engine as _;
+
         let dir = tempfile::tempdir().unwrap();
         let frame = dir.path().join("frame.png");
         std::fs::write(&frame, b"png").unwrap();
+        let canonical_frame = frame.canonicalize().unwrap();
+        let expected_payload = base64::engine::general_purpose::STANDARD
+            .encode(canonical_frame.to_string_lossy().as_bytes());
         let request = AmbientPetDraw {
             frame,
             protocol: ImageProtocol::KittyLocalFile,
@@ -368,8 +373,12 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("a=d,d=I,i=49374,q=2;"));
         assert!(output.contains("\x1b[4;3H"));
-        assert!(output.contains("a=T,t=f,f=100,c=4,r=2,q=2,i=49374;"));
-        assert!(!output.contains("cG5n"));
+        // The encoded filename itself can contain the base64 of the image bytes.
+        // Check the complete file-reference payload instead of a substring ban.
+        assert!(output.contains(&format!(
+            "a=T,t=f,f=100,c=4,r=2,q=2,i=49374;{expected_payload}\x1b\\"
+        )));
+        assert!(!output.contains("a=T,t=d,"));
         assert!(output.contains("\x1b8"));
     }
 
