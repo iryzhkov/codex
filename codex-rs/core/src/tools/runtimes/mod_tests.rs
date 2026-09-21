@@ -848,9 +848,13 @@ async fn snapshot_wrapper_preserves_readonly_dummy_credentials() -> anyhow::Resu
     Ok(())
 }
 
-#[tokio::test]
-async fn snapshot_wrapper_replays_dummy_and_preserves_unbrokered_credentials() -> anyhow::Result<()>
-{
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapshotWrapperScenario {
+    PosixStartup,
+    EnvironmentRestoration,
+}
+
+async fn run_snapshot_wrapper_scenario(scenario: SnapshotWrapperScenario) -> anyhow::Result<()> {
     let proxy = test_credential_broker_network_proxy().await?;
     let dir = tempdir()?;
     let startup = dir.path().join("startup.sh");
@@ -960,30 +964,33 @@ async fn snapshot_wrapper_replays_dummy_and_preserves_unbrokered_credentials() -
             anyhow::ensure!(output.status.success(), "nested shell failed: {output:?}");
             Ok(String::from_utf8(output.stdout)?)
         };
-    let posix_startup = dir.path().join("posix-startup.sh");
-    std::fs::write(&posix_startup, "export OPENAI_API_KEY='sk-posix-secret'\n")?;
-    let posix_snapshot = dir.path().join("posix-startup-snapshot.sh").abs();
-    std::fs::write(
-        &posix_snapshot,
-        format!("export ENV='{}'\n", posix_startup.display()),
-    )?;
-    let mut posix_startup_env = env.clone();
-    posix_startup_env.insert(
-        SNAPSHOT_ORIGINAL_POSIX_ENV_ENV_KEY.to_string(),
-        posix_startup.display().to_string(),
-    );
-    let distinct = wrap_snapshot(&posix_snapshot, &posix_startup_env);
-    assert_eq!(
-        run_nested(&distinct, &posix_startup_env)?,
-        format!("{dummy}|unset")
-    );
-    posix_startup_env.remove(SNAPSHOT_ORIGINAL_BASH_ENV_ENV_KEY);
-    posix_startup_env.insert("ENV".to_string(), posix_startup.display().to_string());
-    let inherited = wrap_snapshot(&posix_snapshot, &posix_startup_env);
-    assert_eq!(
-        run_nested(&inherited, &posix_startup_env)?,
-        format!("{dummy}|unset")
-    );
+    if scenario == SnapshotWrapperScenario::PosixStartup {
+        let posix_startup = dir.path().join("posix-startup.sh");
+        std::fs::write(&posix_startup, "export OPENAI_API_KEY='sk-posix-secret'\n")?;
+        let posix_snapshot = dir.path().join("posix-startup-snapshot.sh").abs();
+        std::fs::write(
+            &posix_snapshot,
+            format!("export ENV='{}'\n", posix_startup.display()),
+        )?;
+        let mut posix_startup_env = env.clone();
+        posix_startup_env.insert(
+            SNAPSHOT_ORIGINAL_POSIX_ENV_ENV_KEY.to_string(),
+            posix_startup.display().to_string(),
+        );
+        let distinct = wrap_snapshot(&posix_snapshot, &posix_startup_env);
+        assert_eq!(
+            run_nested(&distinct, &posix_startup_env)?,
+            format!("{dummy}|unset")
+        );
+        posix_startup_env.remove(SNAPSHOT_ORIGINAL_BASH_ENV_ENV_KEY);
+        posix_startup_env.insert("ENV".to_string(), posix_startup.display().to_string());
+        let inherited = wrap_snapshot(&posix_snapshot, &posix_startup_env);
+        assert_eq!(
+            run_nested(&inherited, &posix_startup_env)?,
+            format!("{dummy}|unset")
+        );
+        return Ok(());
+    }
 
     let wrap_bash_snapshot = |snapshot: &AbsolutePathBuf, env: &HashMap<String, String>| {
         wrap_brokered_snapshot(&shell, snapshot, env, &no_prepends)
@@ -1394,6 +1401,16 @@ async fn snapshot_wrapper_replays_dummy_and_preserves_unbrokered_credentials() -
         );
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_wrapper_replays_dummy_with_posix_startup() -> anyhow::Result<()> {
+    run_snapshot_wrapper_scenario(SnapshotWrapperScenario::PosixStartup).await
+}
+
+#[tokio::test]
+async fn snapshot_wrapper_preserves_unbrokered_credentials() -> anyhow::Result<()> {
+    run_snapshot_wrapper_scenario(SnapshotWrapperScenario::EnvironmentRestoration).await
 }
 
 #[cfg(target_os = "macos")]

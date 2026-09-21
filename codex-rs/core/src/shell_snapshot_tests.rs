@@ -586,8 +586,21 @@ async fn inactive_profiles_keep_snapshots_but_active_brokers_require_sandbox() -
 }
 
 #[cfg(unix)]
-#[tokio::test]
-async fn snapshot_discovers_and_redacts_shell_initialized_credentials() -> Result<()> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InitializedCredentialScenario {
+    Discovery,
+    Restoration,
+    Filtering,
+    PosixStartup,
+    AliasSafety,
+    GithubAlias,
+    OpaqueAlias,
+    HashAlias,
+}
+
+async fn run_initialized_credential_scenario(
+    scenario: InitializedCredentialScenario,
+) -> Result<()> {
     let dir = tempdir()?;
     let startup = dir.path().join("startup.sh");
     std::fs::write(
@@ -722,189 +735,192 @@ async fn snapshot_discovers_and_redacts_shell_initialized_credentials() -> Resul
         /*sandbox*/ None,
     )
     .await?;
-    let captured_credentials = credentials.as_ref().expect("brokered snapshot credentials");
-    assert_eq!(
-        captured_credentials
-            .context_env
-            .get("STRIPE_HOST")
-            .map(String::as_str),
-        Some("api.stripe.example"),
-        "excluding a trusted destination must not let startup replace it"
-    );
-    assert_eq!(
-        captured_credentials
-            .context_env
-            .get("VENDOR_HOST")
-            .map(String::as_str),
-        Some("https://api.vendor.example/v2")
-    );
-    assert_eq!(
-        captured_credentials
-            .context_env
-            .get("OPENAI_BASE_URL")
-            .map(String::as_str),
-        Some("https://api.snapshot.example/v1")
-    );
-    let snapshot = fs::read_to_string(&path).await?;
+    if scenario == InitializedCredentialScenario::Discovery {
+        let captured_credentials = credentials.as_ref().expect("brokered snapshot credentials");
+        assert_eq!(
+            captured_credentials
+                .context_env
+                .get("STRIPE_HOST")
+                .map(String::as_str),
+            Some("api.stripe.example"),
+            "excluding a trusted destination must not let startup replace it"
+        );
+        assert_eq!(
+            captured_credentials
+                .context_env
+                .get("VENDOR_HOST")
+                .map(String::as_str),
+            Some("https://api.vendor.example/v2")
+        );
+        assert_eq!(
+            captured_credentials
+                .context_env
+                .get("OPENAI_BASE_URL")
+                .map(String::as_str),
+            Some("https://api.snapshot.example/v1")
+        );
+        let snapshot = fs::read_to_string(&path).await?;
 
-    for secret in [
-        "ghp_shell_only_secret",
-        "ghp_readonly_secret",
-        "ghp_enterprise_secret",
-        "sk-proj-snapshot-secret",
-        "stripe_live_abcdefghijklmnopqrstuvwx",
-        "pin_abcdefgh",
-        "local_abcdefghijklmnopqrstuvwx",
-        "identity-token-secret",
-    ] {
-        assert!(!snapshot.contains(secret), "snapshot exposed {secret}");
-    }
-    assert!(!snapshot.contains("attacker.example"));
-    assert!(!snapshot.contains("CODEX_NETWORK_PROXY_BROKERED_CREDENTIALS"));
-    assert!(snapshot.contains("api.snapshot.example"));
-    assert!(!snapshot.contains("attacker.vendor.example"));
-    assert!(snapshot.contains("IDENTITY_SEEN=\"missing\""));
-    assert!(snapshot.contains("EXCLUDED_PARENT_HOME=\"missing\""));
-    assert!(snapshot.contains("STARTUP_PATH_OVERRIDE_SEEN=\"/enterprise/bin\""));
-    assert!(snapshot.contains("declare -x PATH=\"/enterprise/bin\""));
-    assert!(snapshot.contains("STARTUP_CORP_REGION_SEEN=\"production\""));
-    assert!(snapshot.contains("STARTUP_NPM_TOKEN_SEEN=\"npm_enterprise_token\""));
-    assert!(snapshot.contains("declare -rx HOMEBREW_GITHUB_API_TOKEN=\"${GITHUB_TOKEN-}\""));
-    assert!(snapshot.contains("${VENDOR_PASSWORD-}"));
-    assert!(!snapshot.contains("api.stripe.example"));
+        for secret in [
+            "ghp_shell_only_secret",
+            "ghp_readonly_secret",
+            "ghp_enterprise_secret",
+            "sk-proj-snapshot-secret",
+            "stripe_live_abcdefghijklmnopqrstuvwx",
+            "pin_abcdefgh",
+            "local_abcdefghijklmnopqrstuvwx",
+            "identity-token-secret",
+        ] {
+            assert!(!snapshot.contains(secret), "snapshot exposed {secret}");
+        }
+        assert!(!snapshot.contains("attacker.example"));
+        assert!(!snapshot.contains("CODEX_NETWORK_PROXY_BROKERED_CREDENTIALS"));
+        assert!(snapshot.contains("api.snapshot.example"));
+        assert!(!snapshot.contains("attacker.vendor.example"));
+        assert!(snapshot.contains("IDENTITY_SEEN=\"missing\""));
+        assert!(snapshot.contains("EXCLUDED_PARENT_HOME=\"missing\""));
+        assert!(snapshot.contains("STARTUP_PATH_OVERRIDE_SEEN=\"/enterprise/bin\""));
+        assert!(snapshot.contains("declare -x PATH=\"/enterprise/bin\""));
+        assert!(snapshot.contains("STARTUP_CORP_REGION_SEEN=\"production\""));
+        assert!(snapshot.contains("STARTUP_NPM_TOKEN_SEEN=\"npm_enterprise_token\""));
+        assert!(snapshot.contains("declare -rx HOMEBREW_GITHUB_API_TOKEN=\"${GITHUB_TOKEN-}\""));
+        assert!(snapshot.contains("${VENDOR_PASSWORD-}"));
+        assert!(!snapshot.contains("api.stripe.example"));
 
-    validate_snapshot(
-        &shell,
-        &path,
-        &dir.path().abs(),
-        Some(&credential_broker),
-        /*sandbox*/ None,
-    )
-    .await?;
+        validate_snapshot(
+            &shell,
+            &path,
+            &dir.path().abs(),
+            Some(&credential_broker),
+            /*sandbox*/ None,
+        )
+        .await?;
 
-    let validation_path = dir.path().join("validation.sh").abs();
-    fs::write(
-        &validation_path,
-        "test \"${HOME-missing}\" = missing && \
+        let validation_path = dir.path().join("validation.sh").abs();
+        fs::write(
+            &validation_path,
+            "test \"${HOME-missing}\" = missing && \
          test \"${CODEX_NETWORK_PROXY_CREDENTIAL_BROKER_ACTIVE-}\" = 1\n",
-    )
-    .await?;
-    validate_snapshot(
-        &shell,
-        &validation_path,
-        &dir.path().abs(),
-        Some(&credential_broker),
-        /*sandbox*/ None,
-    )
-    .await?;
+        )
+        .await?;
+        validate_snapshot(
+            &shell,
+            &validation_path,
+            &dir.path().abs(),
+            Some(&credential_broker),
+            /*sandbox*/ None,
+        )
+        .await?;
 
-    let filtered_startup_broker = SnapshotCredentialBroker {
-        network_proxy: network_proxy.clone(),
-        shell_environment_policy: ShellEnvironmentPolicy {
-            r#set: HashMap::from([trusted_startup.clone()]),
-            include_only: vec![
-                EnvironmentVariablePattern::new_case_insensitive("PATH"),
-                EnvironmentVariablePattern::new_case_insensitive("EXCLUDED_PARENT_HOME"),
-            ],
-            ..ShellEnvironmentPolicy::default()
-        },
-        allow_login_shell: false,
-    };
-    let filtered_startup_path = dir.path().join("filtered-startup-snapshot.sh").abs();
-    write_shell_snapshot(
-        &shell,
-        &filtered_startup_path,
-        &dir.path().abs(),
-        Some(&filtered_startup_broker),
-        /*sandbox*/ None,
-    )
-    .await?;
-    assert!(
-        !fs::read_to_string(&filtered_startup_path)
-            .await?
-            .contains("EXCLUDED_PARENT_HOME")
-    );
+        let filtered_startup_broker = SnapshotCredentialBroker {
+            network_proxy: network_proxy.clone(),
+            shell_environment_policy: ShellEnvironmentPolicy {
+                r#set: HashMap::from([trusted_startup.clone()]),
+                include_only: vec![
+                    EnvironmentVariablePattern::new_case_insensitive("PATH"),
+                    EnvironmentVariablePattern::new_case_insensitive("EXCLUDED_PARENT_HOME"),
+                ],
+                ..ShellEnvironmentPolicy::default()
+            },
+            allow_login_shell: false,
+        };
+        let filtered_startup_path = dir.path().join("filtered-startup-snapshot.sh").abs();
+        write_shell_snapshot(
+            &shell,
+            &filtered_startup_path,
+            &dir.path().abs(),
+            Some(&filtered_startup_broker),
+            /*sandbox*/ None,
+        )
+        .await?;
+        assert!(
+            !fs::read_to_string(&filtered_startup_path)
+                .await?
+                .contains("EXCLUDED_PARENT_HOME")
+        );
 
-    let mut excluded_credential_broker = SnapshotCredentialBroker {
-        network_proxy: network_proxy.clone(),
-        shell_environment_policy: shell_environment_policy.clone(),
-        allow_login_shell: false,
-    };
-    excluded_credential_broker
-        .shell_environment_policy
-        .exclude
-        .push(EnvironmentVariablePattern::new_case_insensitive("GH_TOKEN"));
-    let (_, excluded_credentials) = capture_snapshot(
-        &shell,
-        &dir.path().abs(),
-        Some(&excluded_credential_broker),
-        /*sandbox*/ None,
-    )
-    .await?;
-    assert_eq!(
-        excluded_credentials.unwrap().unset_credential_keys,
-        [
-            "AUTH_BUNDLE",
-            "AUTH_HEADER",
-            "GH_TOKEN",
-            "GITHUB_ENTERPRISE_TOKEN",
-            "UNSET_AUTH_HEADER",
-        ]
-    );
+        let mut excluded_credential_broker = SnapshotCredentialBroker {
+            network_proxy: network_proxy.clone(),
+            shell_environment_policy: shell_environment_policy.clone(),
+            allow_login_shell: false,
+        };
+        excluded_credential_broker
+            .shell_environment_policy
+            .exclude
+            .push(EnvironmentVariablePattern::new_case_insensitive("GH_TOKEN"));
+        let (_, excluded_credentials) = capture_snapshot(
+            &shell,
+            &dir.path().abs(),
+            Some(&excluded_credential_broker),
+            /*sandbox*/ None,
+        )
+        .await?;
+        assert_eq!(
+            excluded_credentials.unwrap().unset_credential_keys,
+            [
+                "AUTH_BUNDLE",
+                "AUTH_HEADER",
+                "GH_TOKEN",
+                "GITHUB_ENTERPRISE_TOKEN",
+                "UNSET_AUTH_HEADER",
+            ]
+        );
 
-    let inherited_secret = "ghp_inherited_enterprise_secret";
-    let inherited_context = HashMap::from([(
-        "GH_HOST".to_string(),
-        "github.inherited.example".to_string(),
-    )]);
-    let mut inherited_discovery_env = HashMap::from([
-        (
+        let inherited_secret = "ghp_inherited_enterprise_secret";
+        let inherited_context = HashMap::from([(
+            "GH_HOST".to_string(),
+            "github.inherited.example".to_string(),
+        )]);
+        let mut inherited_discovery_env = HashMap::from([
+            (
+                "GH_ENTERPRISE_TOKEN".to_string(),
+                inherited_secret.to_string(),
+            ),
+            ("GH_HOST".to_string(), "attacker.example".to_string()),
+        ]);
+        replace_provider_context_with_trusted(
+            &mut inherited_discovery_env,
+            &inherited_context,
+            network_proxy
+                .credential_broker_environment(&HashMap::new())
+                .provider_context_keys,
+            &[],
+        );
+        assert_eq!(
+            inherited_discovery_env.get("GH_HOST").map(String::as_str),
+            Some("github.inherited.example")
+        );
+        network_proxy.apply_to_env(&mut inherited_discovery_env);
+        let mut inherited_allowed_env = HashMap::from([(
             "GH_ENTERPRISE_TOKEN".to_string(),
             inherited_secret.to_string(),
-        ),
-        ("GH_HOST".to_string(), "attacker.example".to_string()),
-    ]);
-    replace_provider_context_with_trusted(
-        &mut inherited_discovery_env,
-        &inherited_context,
-        network_proxy
-            .credential_broker_environment(&HashMap::new())
-            .provider_context_keys,
-        &[],
-    );
-    assert_eq!(
-        inherited_discovery_env.get("GH_HOST").map(String::as_str),
-        Some("github.inherited.example")
-    );
-    network_proxy.apply_to_env(&mut inherited_discovery_env);
-    let mut inherited_allowed_env = HashMap::from([(
-        "GH_ENTERPRISE_TOKEN".to_string(),
-        inherited_secret.to_string(),
-    )]);
-    replace_provider_context_with_trusted(
-        &mut inherited_allowed_env,
-        &inherited_context,
-        network_proxy
-            .credential_broker_environment(&inherited_discovery_env)
-            .binding_keys,
-        &[],
-    );
-    network_proxy.apply_to_env(&mut inherited_allowed_env);
-    assert_eq!(
-        inherited_allowed_env.get("GH_HOST").map(String::as_str),
-        Some("github.inherited.example")
-    );
-    assert_ne!(
-        inherited_allowed_env
-            .get("GH_ENTERPRISE_TOKEN")
-            .map(String::as_str),
-        Some(inherited_secret)
-    );
-    let mut inherited_snapshot = format!("export GH_ENTERPRISE_TOKEN={inherited_secret}\n");
-    assert!(
-        network_proxy.virtualize_brokered_text(&mut inherited_snapshot, &inherited_allowed_env)
-    );
-    assert!(!inherited_snapshot.contains(inherited_secret));
+        )]);
+        replace_provider_context_with_trusted(
+            &mut inherited_allowed_env,
+            &inherited_context,
+            network_proxy
+                .credential_broker_environment(&inherited_discovery_env)
+                .binding_keys,
+            &[],
+        );
+        network_proxy.apply_to_env(&mut inherited_allowed_env);
+        assert_eq!(
+            inherited_allowed_env.get("GH_HOST").map(String::as_str),
+            Some("github.inherited.example")
+        );
+        assert_ne!(
+            inherited_allowed_env
+                .get("GH_ENTERPRISE_TOKEN")
+                .map(String::as_str),
+            Some(inherited_secret)
+        );
+        let mut inherited_snapshot = format!("export GH_ENTERPRISE_TOKEN={inherited_secret}\n");
+        assert!(
+            network_proxy.virtualize_brokered_text(&mut inherited_snapshot, &inherited_allowed_env)
+        );
+        assert!(!inherited_snapshot.contains(inherited_secret));
+        return Ok(());
+    }
 
     let snapshot_file = ShellSnapshotFile { path, credentials };
     let unset_credential_keys = snapshot_file
@@ -1158,132 +1174,150 @@ async fn snapshot_discovers_and_redacts_shell_initialized_credentials() -> Resul
             env["VENDOR_HOST"]
         )
     );
+    if scenario == InitializedCredentialScenario::Restoration {
+        return Ok(());
+    }
 
-    let filtered_policy = ShellEnvironmentPolicy {
-        include_only: vec![EnvironmentVariablePattern::new_case_insensitive("GH_HOST")],
-        ..ShellEnvironmentPolicy::default()
-    };
-    let mut filtered_env = HashMap::new();
-    let _ = snapshot_file.restore_credentials(&mut filtered_env, &filtered_policy);
-    assert!(filtered_env.is_empty());
-
-    let partially_filtered_credential_broker = SnapshotCredentialBroker {
-        network_proxy: network_proxy.clone(),
-        shell_environment_policy: ShellEnvironmentPolicy {
-            r#set: HashMap::from([trusted_startup.clone()]),
-            include_only: vec![
-                EnvironmentVariablePattern::new_case_insensitive("BASH_ENV"),
-                EnvironmentVariablePattern::new_case_insensitive("GH_TOKEN"),
-                EnvironmentVariablePattern::new_case_insensitive("AUTH_HEADER"),
-                EnvironmentVariablePattern::new_case_insensitive("AUTH_BUNDLE"),
-            ],
+    if scenario == InitializedCredentialScenario::Filtering {
+        let filtered_policy = ShellEnvironmentPolicy {
+            include_only: vec![EnvironmentVariablePattern::new_case_insensitive("GH_HOST")],
             ..ShellEnvironmentPolicy::default()
-        },
-        allow_login_shell: false,
-    };
-    for (github_token, openai_api_key) in [
-        ("ghp_shell_only_secret", "sk-proj-snapshot-secret"),
-        (env["GH_TOKEN"].as_str(), env["OPENAI_API_KEY"].as_str()),
-    ] {
-        std::fs::write(
-            &startup,
-            format!(
-                "export GH_TOKEN='{github_token}'\n\
+        };
+        let mut filtered_env = HashMap::new();
+        let _ = snapshot_file.restore_credentials(&mut filtered_env, &filtered_policy);
+        assert!(filtered_env.is_empty());
+
+        let partially_filtered_credential_broker = SnapshotCredentialBroker {
+            network_proxy: network_proxy.clone(),
+            shell_environment_policy: ShellEnvironmentPolicy {
+                r#set: HashMap::from([trusted_startup.clone()]),
+                include_only: vec![
+                    EnvironmentVariablePattern::new_case_insensitive("BASH_ENV"),
+                    EnvironmentVariablePattern::new_case_insensitive("GH_TOKEN"),
+                    EnvironmentVariablePattern::new_case_insensitive("AUTH_HEADER"),
+                    EnvironmentVariablePattern::new_case_insensitive("AUTH_BUNDLE"),
+                ],
+                ..ShellEnvironmentPolicy::default()
+            },
+            allow_login_shell: false,
+        };
+        for (github_token, openai_api_key) in [
+            ("ghp_shell_only_secret", "sk-proj-snapshot-secret"),
+            (env["GH_TOKEN"].as_str(), env["OPENAI_API_KEY"].as_str()),
+        ] {
+            std::fs::write(
+                &startup,
+                format!(
+                    "export GH_TOKEN='{github_token}'\n\
                  export GITHUB_TOKEN=\"$GH_TOKEN\"\n\
                  export AUTH_HEADER=\"Bearer $GH_TOKEN\"\n\
                  export OPENAI_API_KEY='{openai_api_key}'\n\
                  export AUTH_BUNDLE=\"GitHub $GH_TOKEN\n\
                  OpenAI $OPENAI_API_KEY\"\n\
                  unset OPENAI_API_KEY\n"
-            ),
-        )?;
-        let partially_filtered_path = dir.path().join("partially-filtered-snapshot.sh").abs();
-        let filtered_credentials = write_shell_snapshot(
-            &shell,
-            &partially_filtered_path,
-            &dir.path().abs(),
-            Some(&partially_filtered_credential_broker),
-            /*sandbox*/ None,
-        )
-        .await?;
-        let filtered_replay = Command::new("/bin/bash")
-            .arg("-c")
-            .arg(". \"$1\" && printf '%s\\n%s' \"$AUTH_HEADER\" \"${AUTH_BUNDLE-unset}\"")
-            .arg("snapshot")
-            .arg(partially_filtered_path.as_path())
-            .env_clear()
-            .env("GH_TOKEN", "ghp_filtered_dummy")
-            .output()?;
-        assert!(filtered_replay.status.success());
-        assert_eq!(
-            String::from_utf8(filtered_replay.stdout)?,
-            "Bearer ghp_filtered_dummy\nunset"
-        );
-        let filtered_snapshot = ShellSnapshotFile {
-            path: partially_filtered_path,
-            credentials: filtered_credentials,
-        };
-        let mut fail_open_env = HashMap::new();
-        filtered_snapshot
-            .restore_fail_open_aliases(&mut fail_open_env, /*environment_id*/ None);
-        assert!(!fail_open_env.contains_key("AUTH_BUNDLE"));
+                ),
+            )?;
+            let partially_filtered_path = dir.path().join("partially-filtered-snapshot.sh").abs();
+            let filtered_credentials = write_shell_snapshot(
+                &shell,
+                &partially_filtered_path,
+                &dir.path().abs(),
+                Some(&partially_filtered_credential_broker),
+                /*sandbox*/ None,
+            )
+            .await?;
+            let filtered_replay = Command::new("/bin/bash")
+                .arg("-c")
+                .arg(". \"$1\" && printf '%s\\n%s' \"$AUTH_HEADER\" \"${AUTH_BUNDLE-unset}\"")
+                .arg("snapshot")
+                .arg(partially_filtered_path.as_path())
+                .env_clear()
+                .env("GH_TOKEN", "ghp_filtered_dummy")
+                .output()?;
+            assert!(filtered_replay.status.success());
+            assert_eq!(
+                String::from_utf8(filtered_replay.stdout)?,
+                "Bearer ghp_filtered_dummy\nunset"
+            );
+            let filtered_snapshot = ShellSnapshotFile {
+                path: partially_filtered_path,
+                credentials: filtered_credentials,
+            };
+            let mut fail_open_env = HashMap::new();
+            filtered_snapshot
+                .restore_fail_open_aliases(&mut fail_open_env, /*environment_id*/ None);
+            assert!(!fail_open_env.contains_key("AUTH_BUNDLE"));
+        }
+        return Ok(());
     }
 
-    let posix_startup = dir.path().join("posix-startup.sh");
-    std::fs::write(
-        &posix_startup,
-        "export GH_TOKEN='ghp_posix_shell_secret'\nexport POSIX_STARTUP_LOADED=1\n",
-    )?;
-    let posix_shell = Shell {
-        shell_type: ShellType::Sh,
-        shell_path: PathBuf::from("/bin/sh"),
-    };
-    let posix_credential_broker = SnapshotCredentialBroker {
+    if scenario == InitializedCredentialScenario::PosixStartup {
+        let posix_startup = dir.path().join("posix-startup.sh");
+        std::fs::write(
+            &posix_startup,
+            "export GH_TOKEN='ghp_posix_shell_secret'\nexport POSIX_STARTUP_LOADED=1\n",
+        )?;
+        let posix_shell = Shell {
+            shell_type: ShellType::Sh,
+            shell_path: PathBuf::from("/bin/sh"),
+        };
+        let posix_credential_broker = SnapshotCredentialBroker {
+            network_proxy: network_proxy.clone(),
+            shell_environment_policy: ShellEnvironmentPolicy {
+                r#set: HashMap::from([("ENV".to_string(), "$PWD/posix-startup.sh".to_string())]),
+                ..ShellEnvironmentPolicy::default()
+            },
+            allow_login_shell: true,
+        };
+        let posix_snapshot_path = dir.path().join("posix-snapshot.sh").abs();
+        let posix_credentials = write_shell_snapshot(
+            &posix_shell,
+            &posix_snapshot_path,
+            &dir.path().abs(),
+            Some(&posix_credential_broker),
+            /*sandbox*/ None,
+        )
+        .await?
+        .expect("brokered POSIX snapshot has credentials");
+        let posix_snapshot = fs::read_to_string(&posix_snapshot_path).await?;
+        assert!(posix_snapshot.contains("POSIX_STARTUP_LOADED"));
+        assert!(!posix_snapshot.contains("ghp_posix_shell_secret"));
+        assert_eq!(
+            posix_credentials
+                .protected_startup_env
+                .as_deref()
+                .map(std::fs::canonicalize)
+                .transpose()?,
+            Some(std::fs::canonicalize(&posix_startup)?)
+        );
+
+        std::fs::write(&posix_startup, "export APPLICATION_SETTING=production\n")?;
+        let application_snapshot_path = dir.path().join("posix-application-snapshot.sh").abs();
+        let application_credentials = write_shell_snapshot(
+            &posix_shell,
+            &application_snapshot_path,
+            &dir.path().abs(),
+            Some(&posix_credential_broker),
+            /*sandbox*/ None,
+        )
+        .await?
+        .expect("brokered POSIX application snapshot has credentials");
+        assert!(application_credentials.protected_startup_env.is_none());
+        return Ok(());
+    }
+
+    let inherited_credential_broker = SnapshotCredentialBroker {
         network_proxy: network_proxy.clone(),
         shell_environment_policy: ShellEnvironmentPolicy {
-            r#set: HashMap::from([("ENV".to_string(), "$PWD/posix-startup.sh".to_string())]),
+            r#set: HashMap::from([trusted_startup.clone()]),
             ..ShellEnvironmentPolicy::default()
         },
-        allow_login_shell: true,
+        allow_login_shell: false,
     };
-    let posix_snapshot_path = dir.path().join("posix-snapshot.sh").abs();
-    let posix_credentials = write_shell_snapshot(
-        &posix_shell,
-        &posix_snapshot_path,
-        &dir.path().abs(),
-        Some(&posix_credential_broker),
-        /*sandbox*/ None,
-    )
-    .await?
-    .expect("brokered POSIX snapshot has credentials");
-    let posix_snapshot = fs::read_to_string(&posix_snapshot_path).await?;
-    assert!(posix_snapshot.contains("POSIX_STARTUP_LOADED"));
-    assert!(!posix_snapshot.contains("ghp_posix_shell_secret"));
-    assert_eq!(
-        posix_credentials
-            .protected_startup_env
-            .as_deref()
-            .map(std::fs::canonicalize)
-            .transpose()?,
-        Some(std::fs::canonicalize(&posix_startup)?)
-    );
-
-    std::fs::write(&posix_startup, "export APPLICATION_SETTING=production\n")?;
-    let application_snapshot_path = dir.path().join("posix-application-snapshot.sh").abs();
-    let application_credentials = write_shell_snapshot(
-        &posix_shell,
-        &application_snapshot_path,
-        &dir.path().abs(),
-        Some(&posix_credential_broker),
-        /*sandbox*/ None,
-    )
-    .await?
-    .expect("brokered POSIX application snapshot has credentials");
-    assert!(application_credentials.protected_startup_env.is_none());
-
-    std::fs::write(
-        &startup,
-        "export GH_TOKEN='ghp_hidden_alias_secret'\n\
+    if scenario == InitializedCredentialScenario::AliasSafety {
+        std::fs::write(
+            &startup,
+            "export GH_TOKEN='ghp_hidden_alias_secret'\n\
          export HIDDEN_HEADER=\"prefix\\\"$GH_TOKEN\\\"suffix\"\n\
          export GITHUB_TOKEN='ghp_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh'\n\
          export UNKNOWN_HEADER=\"Bearer $GITHUB_TOKEN\"\n\
@@ -1291,143 +1325,141 @@ async fn snapshot_discovers_and_redacts_shell_initialized_credentials() -> Resul
          export STRIPE_HIDDEN_HEADER=\"Bearer $STRIPE_API_KEY\"\n\
          export STRIPE_HOST='api.stripe.example'\n\
          unset GH_TOKEN GITHUB_TOKEN GITHUB_ENTERPRISE_TOKEN STRIPE_API_KEY\n",
-    )?;
-    let mut previously_brokered_env = HashMap::from([(
-        "GH_TOKEN".to_string(),
-        "ghp_hidden_alias_secret".to_string(),
-    )]);
-    network_proxy.apply_to_env(&mut previously_brokered_env);
-    let inherited_credential_broker = SnapshotCredentialBroker {
-        network_proxy: network_proxy.clone(),
-        shell_environment_policy: ShellEnvironmentPolicy {
-            r#set: HashMap::from([trusted_startup]),
-            ..ShellEnvironmentPolicy::default()
-        },
-        allow_login_shell: false,
-    };
-    let inherited_path = dir.path().join("inherited-snapshot.sh").abs();
-    let inherited_credentials = write_shell_snapshot(
-        &shell,
-        &inherited_path,
-        &dir.path().abs(),
-        Some(&inherited_credential_broker),
-        /*sandbox*/ None,
-    )
-    .await?;
-    let inherited_snapshot = fs::read_to_string(&inherited_path).await?;
-    assert!(!inherited_snapshot.contains("ghp_hidden_alias_secret"));
-    assert!(!inherited_snapshot.contains("ghp_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh"));
-    assert!(!inherited_snapshot.contains("stripe_live_zyxwvutsrqponmlkjihgfedc"));
-    let inherited_replay = Command::new("/bin/bash")
+        )?;
+        let mut previously_brokered_env = HashMap::from([(
+            "GH_TOKEN".to_string(),
+            "ghp_hidden_alias_secret".to_string(),
+        )]);
+        network_proxy.apply_to_env(&mut previously_brokered_env);
+        let inherited_path = dir.path().join("inherited-snapshot.sh").abs();
+        let inherited_credentials = write_shell_snapshot(
+            &shell,
+            &inherited_path,
+            &dir.path().abs(),
+            Some(&inherited_credential_broker),
+            /*sandbox*/ None,
+        )
+        .await?;
+        let inherited_snapshot = fs::read_to_string(&inherited_path).await?;
+        assert!(!inherited_snapshot.contains("ghp_hidden_alias_secret"));
+        assert!(!inherited_snapshot.contains("ghp_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh"));
+        assert!(!inherited_snapshot.contains("stripe_live_zyxwvutsrqponmlkjihgfedc"));
+        let inherited_replay = Command::new("/bin/bash")
         .arg("-c")
         .arg(". \"$1\" && printf '%s\\n%s\\n%s' \"${HIDDEN_HEADER-unset}\" \"${UNKNOWN_HEADER-unset}\" \"${STRIPE_HIDDEN_HEADER-unset}\"")
         .arg("snapshot")
         .arg(inherited_path.as_path())
         .env_clear()
         .output()?;
-    assert!(inherited_replay.status.success());
-    assert_eq!(
-        String::from_utf8(inherited_replay.stdout)?,
-        "unset\nunset\nunset"
-    );
+        assert!(inherited_replay.status.success());
+        assert_eq!(
+            String::from_utf8(inherited_replay.stdout)?,
+            "unset\nunset\nunset"
+        );
 
-    let snapshot_file = ShellSnapshotFile {
-        path: inherited_path,
-        credentials: inherited_credentials,
-    };
-    let real_hidden_header = "prefix\"ghp_hidden_alias_secret\"suffix";
-    let real_header = "Bearer ghp_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh";
-    let real_stripe_header = "Bearer stripe_live_zyxwvutsrqponmlkjihgfedc";
-    let mut brokered_env = HashMap::new();
-    let credential_context = snapshot_file.restore_credentials(
-        &mut brokered_env,
-        &inherited_credential_broker.shell_environment_policy,
-    );
-    brokered_env = credential_context
-        .prepare_child_environment(
-            &inherited_credential_broker.network_proxy,
-            brokered_env,
-            /*environment_id*/ None,
-        )?
-        .env;
-    let dummy_header = brokered_env["UNKNOWN_HEADER"].clone();
-    let dummy_hidden_header = brokered_env["HIDDEN_HEADER"].clone();
-    let dummy_stripe_header = brokered_env["STRIPE_HIDDEN_HEADER"].clone();
-    assert_ne!(dummy_header, real_header);
-    assert_ne!(dummy_hidden_header, real_hidden_header);
-    assert_ne!(dummy_stripe_header, real_stripe_header);
-    snapshot_file.restore_fail_open_aliases(&mut brokered_env, /*environment_id*/ None);
-    assert_eq!(
-        brokered_env.get("UNKNOWN_HEADER").map(String::as_str),
-        Some(dummy_header.as_str())
-    );
-    assert_eq!(
-        brokered_env.get("HIDDEN_HEADER").map(String::as_str),
-        Some(dummy_hidden_header.as_str())
-    );
-    assert_eq!(
-        brokered_env.get("STRIPE_HIDDEN_HEADER").map(String::as_str),
-        Some(dummy_stripe_header.as_str())
-    );
+        let snapshot_file = ShellSnapshotFile {
+            path: inherited_path,
+            credentials: inherited_credentials,
+        };
+        let real_hidden_header = "prefix\"ghp_hidden_alias_secret\"suffix";
+        let real_header = "Bearer ghp_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh";
+        let real_stripe_header = "Bearer stripe_live_zyxwvutsrqponmlkjihgfedc";
+        let mut brokered_env = HashMap::new();
+        let credential_context = snapshot_file.restore_credentials(
+            &mut brokered_env,
+            &inherited_credential_broker.shell_environment_policy,
+        );
+        brokered_env = credential_context
+            .prepare_child_environment(
+                &inherited_credential_broker.network_proxy,
+                brokered_env,
+                /*environment_id*/ None,
+            )?
+            .env;
+        let dummy_header = brokered_env["UNKNOWN_HEADER"].clone();
+        let dummy_hidden_header = brokered_env["HIDDEN_HEADER"].clone();
+        let dummy_stripe_header = brokered_env["STRIPE_HIDDEN_HEADER"].clone();
+        assert_ne!(dummy_header, real_header);
+        assert_ne!(dummy_hidden_header, real_hidden_header);
+        assert_ne!(dummy_stripe_header, real_stripe_header);
+        snapshot_file.restore_fail_open_aliases(&mut brokered_env, /*environment_id*/ None);
+        assert_eq!(
+            brokered_env.get("UNKNOWN_HEADER").map(String::as_str),
+            Some(dummy_header.as_str())
+        );
+        assert_eq!(
+            brokered_env.get("HIDDEN_HEADER").map(String::as_str),
+            Some(dummy_hidden_header.as_str())
+        );
+        assert_eq!(
+            brokered_env.get("STRIPE_HIDDEN_HEADER").map(String::as_str),
+            Some(dummy_stripe_header.as_str())
+        );
 
-    let mut fail_open_env = HashMap::new();
-    let _ = snapshot_file.restore_credentials(
-        &mut fail_open_env,
-        &inherited_credential_broker.shell_environment_policy,
-    );
-    snapshot_file.restore_fail_open_aliases(&mut fail_open_env, /*environment_id*/ None);
-    assert_eq!(
-        fail_open_env.get("UNKNOWN_HEADER").map(String::as_str),
-        Some(real_header)
-    );
-    assert_eq!(
-        fail_open_env.get("HIDDEN_HEADER").map(String::as_str),
-        Some(real_hidden_header)
-    );
-    assert_eq!(
-        fail_open_env
-            .get("STRIPE_HIDDEN_HEADER")
-            .map(String::as_str),
-        Some(real_stripe_header)
-    );
+        let mut fail_open_env = HashMap::new();
+        let _ = snapshot_file.restore_credentials(
+            &mut fail_open_env,
+            &inherited_credential_broker.shell_environment_policy,
+        );
+        snapshot_file.restore_fail_open_aliases(&mut fail_open_env, /*environment_id*/ None);
+        assert_eq!(
+            fail_open_env.get("UNKNOWN_HEADER").map(String::as_str),
+            Some(real_header)
+        );
+        assert_eq!(
+            fail_open_env.get("HIDDEN_HEADER").map(String::as_str),
+            Some(real_hidden_header)
+        );
+        assert_eq!(
+            fail_open_env
+                .get("STRIPE_HIDDEN_HEADER")
+                .map(String::as_str),
+            Some(real_stripe_header)
+        );
 
-    std::fs::write(
-        &startup,
-        "export GH_TOKEN='ghp_hidden_alias_secret'\n\
+        std::fs::write(
+            &startup,
+            "export GH_TOKEN='ghp_hidden_alias_secret'\n\
          credential_function() { printf '%s' 'ghp_hidden_alias_secret'; }\n\
          unset GH_TOKEN\n",
-    )?;
-    let residual_credential = capture_snapshot(
-        &shell,
-        &dir.path().abs(),
-        Some(&inherited_credential_broker),
-        /*sandbox*/ None,
-    )
-    .await;
-    assert!(
-        residual_credential.is_err(),
-        "snapshot with a credential-bearing shell function must be rejected"
-    );
+        )?;
+        let residual_credential = capture_snapshot(
+            &shell,
+            &dir.path().abs(),
+            Some(&inherited_credential_broker),
+            /*sandbox*/ None,
+        )
+        .await;
+        assert!(
+            residual_credential.is_err(),
+            "snapshot with a credential-bearing shell function must be rejected"
+        );
 
-    std::fs::write(
-        &startup,
-        "unset PATH\nset -u\nexport GH_TOKEN='ghp_unset_path_secret'\n",
-    )?;
-    let (unset_path_snapshot, _) = capture_snapshot(
-        &shell,
-        &dir.path().abs(),
-        Some(&inherited_credential_broker),
-        /*sandbox*/ None,
-    )
-    .await?;
-    assert!(!unset_path_snapshot.contains("declare -x PATH="));
-    assert!(!unset_path_snapshot.contains("ghp_unset_path_secret"));
+        std::fs::write(
+            &startup,
+            "unset PATH\nset -u\nexport GH_TOKEN='ghp_unset_path_secret'\n",
+        )?;
+        let (unset_path_snapshot, _) = capture_snapshot(
+            &shell,
+            &dir.path().abs(),
+            Some(&inherited_credential_broker),
+            /*sandbox*/ None,
+        )
+        .await?;
+        assert!(!unset_path_snapshot.contains("declare -x PATH="));
+        assert!(!unset_path_snapshot.contains("ghp_unset_path_secret"));
+        return Ok(());
+    }
 
-    for real in [
-        "ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH",
-        "opaque_enterprise_credential",
-        "0123456789abcdef0123456789abcdef01234567",
-    ] {
+    let real = match scenario {
+        InitializedCredentialScenario::GithubAlias => {
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH"
+        }
+        InitializedCredentialScenario::OpaqueAlias => "opaque_enterprise_credential",
+        InitializedCredentialScenario::HashAlias => "0123456789abcdef0123456789abcdef01234567",
+        _ => unreachable!(),
+    };
+    {
         std::fs::write(
             &startup,
             format!(
@@ -1538,6 +1570,54 @@ async fn snapshot_discovers_and_redacts_shell_initialized_credentials() -> Resul
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn snapshot_discovers_and_redacts_shell_initialized_credentials() -> Result<()> {
+    run_initialized_credential_scenario(InitializedCredentialScenario::Discovery).await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn snapshot_restores_shell_initialized_credentials() -> Result<()> {
+    run_initialized_credential_scenario(InitializedCredentialScenario::Restoration).await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn snapshot_filters_shell_initialized_credentials() -> Result<()> {
+    run_initialized_credential_scenario(InitializedCredentialScenario::Filtering).await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn snapshot_handles_posix_initialized_credentials() -> Result<()> {
+    run_initialized_credential_scenario(InitializedCredentialScenario::PosixStartup).await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn snapshot_rejects_unsafe_initialized_credential_aliases() -> Result<()> {
+    run_initialized_credential_scenario(InitializedCredentialScenario::AliasSafety).await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn snapshot_handles_github_initialized_credential_alias() -> Result<()> {
+    run_initialized_credential_scenario(InitializedCredentialScenario::GithubAlias).await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn snapshot_handles_opaque_initialized_credential_alias() -> Result<()> {
+    run_initialized_credential_scenario(InitializedCredentialScenario::OpaqueAlias).await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn snapshot_handles_hash_initialized_credential_alias() -> Result<()> {
+    run_initialized_credential_scenario(InitializedCredentialScenario::HashAlias).await
 }
 
 #[cfg(unix)]
