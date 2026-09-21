@@ -41,6 +41,7 @@ codex-utils-cargo-bin = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 pretty_assertions = { workspace = true }
 rcgen = { workspace = true }
+reqwest = { workspace = true, features = ["native-tls"] }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
 

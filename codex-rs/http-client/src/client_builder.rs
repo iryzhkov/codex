@@ -42,6 +42,8 @@ pub struct HttpClientBuilder {
 enum TlsBackend {
     #[default]
     TransportDefault,
+    #[cfg(test)]
+    Native,
     Rustls,
 }
 
@@ -93,6 +95,12 @@ impl HttpClientBuilder {
 
     pub(crate) fn follows_redirects(&self) -> bool {
         self.follow_redirects
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_native_tls(mut self) -> Self {
+        self.tls_backend = TlsBackend::Native;
+        self
     }
 
     pub(crate) fn with_rustls_tls(mut self) -> Self {
@@ -149,6 +157,17 @@ impl HttpClientBuilder {
         route: &OutboundProxyRoute,
     ) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
         self.chatgpt_cookie_store = http_client_factory.chatgpt_cookie_store();
+        #[cfg(test)]
+        if self.tls_backend == TlsBackend::Native {
+            let (builder, request_logging) = self.into_reqwest_parts();
+            let inner = http_client_factory
+                .build_reqwest_client_for_resolved_route_without_custom_ca_for_test(
+                    builder,
+                    route_class,
+                    route,
+                )?;
+            return Ok(HttpClient::from_parts(inner, request_logging));
+        }
         let (builder, request_logging) = self.into_reqwest_parts();
         let inner = http_client_factory.build_reqwest_client_for_resolved_route(
             builder,
@@ -275,9 +294,18 @@ impl HttpClientBuilder {
 
     fn base_reqwest_builder(self) -> reqwest::ClientBuilder {
         let mut builder = reqwest::Client::builder();
-        if self.tls_backend == TlsBackend::Rustls {
-            ensure_rustls_crypto_provider();
-            builder = builder.use_rustls_tls();
+        match self.tls_backend {
+            TlsBackend::TransportDefault => {}
+            #[cfg(test)]
+            TlsBackend::Native => {
+                let connector = native_tls::TlsConnector::new()
+                    .expect("native TLS connector should build for tests");
+                builder = builder.use_preconfigured_tls(connector);
+            }
+            TlsBackend::Rustls => {
+                ensure_rustls_crypto_provider();
+                builder = builder.use_rustls_tls();
+            }
         }
         if let Some(default_headers) = self.default_headers {
             builder = builder.default_headers(default_headers);

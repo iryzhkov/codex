@@ -323,6 +323,18 @@ impl RouteAwareClientPool {
         Self::with_builder(http_client_factory, route_class, HttpClientBuilder::new())
     }
 
+    #[cfg(test)]
+    fn new_with_native_tls_for_test(
+        http_client_factory: HttpClientFactory,
+        route_class: ClientRouteClass,
+    ) -> Self {
+        Self::with_builder(
+            http_client_factory,
+            route_class,
+            HttpClientBuilder::new().with_native_tls(),
+        )
+    }
+
     /// Creates a pool that returns redirect responses without following them.
     ///
     /// This applies both when reqwest owns redirect handling and when the pool follows redirects

@@ -35,7 +35,7 @@ async fn default_pool_does_not_retry_a_native_tls_protocol_failure() {
     let (url, attempts, stop_server) =
         spawn_protocol_version_rejection_server(/*maximum_attempts*/ 2)
             .expect("TLS rejection server should start");
-    let pool = RouteAwareClientPool::new(
+    let pool = RouteAwareClientPool::new_with_native_tls_for_test(
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         ClientRouteClass::Other,
     );
@@ -65,7 +65,7 @@ async fn retries_a_native_tls_protocol_failure_once_with_rustls() {
     let (url, attempts, stop_server) =
         spawn_protocol_version_rejection_server(/*maximum_attempts*/ 2)
             .expect("TLS rejection server should start");
-    let pool = RouteAwareClientPool::new(
+    let pool = RouteAwareClientPool::new_with_native_tls_for_test(
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         ClientRouteClass::Other,
     )
@@ -106,7 +106,7 @@ async fn retries_a_native_tls_failure_after_another_request_caches_rustls() {
     let (url, attempts, stop_server) =
         spawn_protocol_version_rejection_server(/*maximum_attempts*/ 2)
             .expect("TLS rejection server should start");
-    let pool = RouteAwareClientPool::new(
+    let pool = RouteAwareClientPool::new_with_native_tls_for_test(
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         ClientRouteClass::Other,
     )
@@ -163,7 +163,7 @@ async fn does_not_retry_a_cached_rustls_tls_protocol_failure() {
     let (url, attempts, stop_server) =
         spawn_protocol_version_rejection_server(/*maximum_attempts*/ 2)
             .expect("TLS rejection server should start");
-    let pool = RouteAwareClientPool::new(
+    let pool = RouteAwareClientPool::new_with_native_tls_for_test(
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         ClientRouteClass::Other,
     )
@@ -199,7 +199,7 @@ async fn does_not_retry_a_cached_rustls_tls_protocol_failure() {
 async fn successful_rustls_fallback_replays_the_request_and_reuses_the_destination() {
     let (url, trusted_rustls_client, observed_requests) =
         spawn_successful_tls_fallback_server().expect("TLS fallback server should start");
-    let pool = RouteAwareClientPool::new(
+    let pool = RouteAwareClientPool::new_with_native_tls_for_test(
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         ClientRouteClass::Other,
     )
@@ -264,7 +264,7 @@ async fn retries_a_tls_protocol_failure_when_request_url_contains_certificate_ma
     let (url, attempts, stop_server) =
         spawn_protocol_version_rejection_server(/*maximum_attempts*/ 2)
             .expect("TLS rejection server should start");
-    let pool = RouteAwareClientPool::new(
+    let pool = RouteAwareClientPool::new_with_native_tls_for_test(
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         ClientRouteClass::Other,
     )
@@ -295,7 +295,7 @@ async fn does_not_retry_a_non_replayable_streaming_request() {
     let (url, attempts, stop_server) =
         spawn_protocol_version_rejection_server(/*maximum_attempts*/ 2)
             .expect("TLS rejection server should start");
-    let pool = RouteAwareClientPool::new(
+    let pool = RouteAwareClientPool::new_with_native_tls_for_test(
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         ClientRouteClass::Other,
     )

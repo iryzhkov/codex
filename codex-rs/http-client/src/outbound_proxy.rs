@@ -300,6 +300,19 @@ impl HttpClientFactory {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn build_reqwest_client_for_resolved_route_without_custom_ca_for_test(
+        &self,
+        builder: reqwest::ClientBuilder,
+        route_class: ClientRouteClass,
+        route: &OutboundProxyRoute,
+    ) -> Result<reqwest::Client, BuildRouteAwareHttpClientError> {
+        configure_builder_for_resolved_route(builder, route_class, route)?
+            .build()
+            .map_err(BuildCustomCaTransportError::BuildClientWithSystemRoots)
+            .map_err(Into::into)
+    }
+
     pub(crate) fn build_reqwest_client_for_resolved_route(
         &self,
         builder: reqwest::ClientBuilder,
