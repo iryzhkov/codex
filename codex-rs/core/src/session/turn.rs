@@ -2521,6 +2521,19 @@ fn assign_missing_streamed_response_item_id(
     Session::assign_missing_response_item_id(item);
 }
 
+fn bounded_read_allows_response_item(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::FunctionCall { name, .. } => name == "read_custodied_page",
+        ResponseItem::CustomToolCall { .. }
+        | ResponseItem::ToolSearchCall { .. }
+        | ResponseItem::LocalShellCall { .. }
+        | ResponseItem::WebSearchCall { .. }
+        | ResponseItem::ImageGenerationCall { .. }
+        | ResponseItem::AdditionalTools { .. } => false,
+        _ => true,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace",
     skip_all,
@@ -2670,6 +2683,12 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::OutputItemDone(mut item) => {
+                if bounded_read && !bounded_read_allows_response_item(&item) {
+                    break Err(CodexErr::Stream(
+                        "invalid-custody: bounded read rejected an unexpected tool-call output"
+                            .to_string(),
+                    ));
+                }
                 if client_session.controlled_response_enabled()
                     && matches!(
                         &item,
@@ -2797,6 +2816,12 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::OutputItemAdded(mut item) => {
+                if bounded_read && !bounded_read_allows_response_item(&item) {
+                    break Err(CodexErr::Stream(
+                        "invalid-custody: bounded read rejected an unexpected tool-call output"
+                            .to_string(),
+                    ));
+                }
                 if client_session.controlled_response_enabled()
                     && matches!(
                         &item,

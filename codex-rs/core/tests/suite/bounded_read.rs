@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use anyhow::Result;
+use codex_protocol::protocol::SessionSource;
 use codex_core::TurnInputRequest;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::user_input::UserInput;
@@ -159,6 +160,110 @@ async fn bounded_read_performs_exactly_two_posts_with_one_custody_tool() -> Resu
     assert!(second.contains(artifact_id));
     assert!(!second.contains("artifact.txt"));
     assert!(!second.contains("manifest.json"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(bounded_read_env)]
+async fn vscode_primary_session_is_admitted() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let _env = custody_env(&dir, "artifact", b"evidence");
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("resp-vscode"),
+            ev_assistant_message("msg-vscode", "done"),
+            ev_completed("resp-vscode"),
+        ])],
+    )
+    .await;
+    let fixture = test_codex()
+        .with_model("gpt-5.4")
+        .with_session_source(SessionSource::VSCode)
+        .build(&server)
+        .await?;
+    fixture
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "answer".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let terminal = wait_for_event(&fixture.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_) | EventMsg::Error(_))
+    })
+    .await;
+    assert!(matches!(terminal, EventMsg::TurnComplete(_)));
+    assert_eq!(responses.requests().len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(bounded_read_env)]
+async fn established_stream_failure_is_recovery_required_without_retry() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let _env = custody_env(&dir, "artifact", b"evidence");
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![sse(vec![ev_response_created("resp-ambiguous")])],
+    )
+    .await;
+    let fixture = test_codex().with_model("gpt-5.4").build(&server).await?;
+    fixture
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "read".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let terminal = wait_for_event(&fixture.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_) | EventMsg::Error(_))
+    })
+    .await;
+    assert!(matches!(terminal, EventMsg::Error(_)));
+    assert!(format!("{terminal:?}").contains("recovery-required"));
+    assert_eq!(responses.requests().len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(bounded_read_env)]
+async fn second_user_turn_is_rejected_before_another_post() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let _env = custody_env(&dir, "artifact", b"evidence");
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ])],
+    )
+    .await;
+    let fixture = test_codex().with_model("gpt-5.4").build(&server).await?;
+    for text in ["first", "second"] {
+        fixture
+            .codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: text.into(),
+                text_elements: Vec::new(),
+            }]))
+            .await?;
+        let terminal = wait_for_event(&fixture.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_) | EventMsg::Error(_))
+        })
+        .await;
+        if text == "first" {
+            assert!(matches!(terminal, EventMsg::TurnComplete(_)));
+        } else {
+            assert!(matches!(terminal, EventMsg::Error(_)));
+            assert!(format!("{terminal:?}").contains("budget-exhausted"));
+        }
+    }
+    assert_eq!(responses.requests().len(), 1);
     Ok(())
 }
 
