@@ -399,10 +399,8 @@ async fn controlled_response_rejects_malicious_tool_call_before_dispatch() -> Re
             text_elements: Vec::new(),
         }]))
         .await?;
-    let EventMsg::Error(error) = wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::Error(_))
-    })
-    .await
+    let EventMsg::Error(error) =
+        wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await
     else {
         unreachable!("event predicate guarantees an error");
     };
@@ -418,7 +416,10 @@ async fn controlled_response_rejects_malicious_tool_call_before_dispatch() -> Re
         unreachable!("event predicate guarantees turn completion");
     };
     assert_eq!(completed.error, Some(error));
-    assert!(!sentinel.exists(), "the rejected tool call must not execute");
+    assert!(
+        !sentinel.exists(),
+        "the rejected tool call must not execute"
+    );
     assert_eq!(mock.requests().len(), 1);
     assert_eq!(
         server

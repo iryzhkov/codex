@@ -508,7 +508,12 @@ async fn streaming_client_with_single_attempt_never_retries_transport_error() {
     };
     let client = ResponsesClient::new(transport.clone(), provider, Arc::new(NoAuth));
 
-    assert!(client.stream_request(request, ResponsesOptions::default()).await.is_err());
+    assert!(
+        client
+            .stream_request(request, ResponsesOptions::default())
+            .await
+            .is_err()
+    );
     assert_eq!(transport.attempts(), 1);
     assert_eq!(transport.requests().len(), 1);
 }

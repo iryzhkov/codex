@@ -197,20 +197,24 @@ enum ControlledResponseConfig {
     Invalid(String),
 }
 
+const CONTROLLED_RESPONSE_FRAMING_RESERVE_TOKENS: u64 = 4096;
+
+fn controlled_response_required_context(input_bytes: usize, max_output: u64) -> Option<u64> {
+    u64::try_from(input_bytes)
+        .ok()?
+        .checked_add(max_output)?
+        .checked_add(CONTROLLED_RESPONSE_FRAMING_RESERVE_TOKENS)
+}
+
 impl ControlledResponseConfig {
     fn from_env() -> Self {
         const INPUT_ENV: &str = "T3_CODEX_CONTROLLED_RESPONSE_MAX_INPUT_BYTES";
         const OUTPUT_ENV: &str = "T3_CODEX_CONTROLLED_RESPONSE_MAX_OUTPUT_TOKENS";
-        let (input, output) = match (
-            std::env::var_os(INPUT_ENV),
-            std::env::var_os(OUTPUT_ENV),
-        ) {
+        let (input, output) = match (std::env::var_os(INPUT_ENV), std::env::var_os(OUTPUT_ENV)) {
             (None, None) => return Self::Disabled,
             (Some(input), Some(output)) => (input, output),
             _ => {
-                return Self::Invalid(format!(
-                    "{INPUT_ENV} and {OUTPUT_ENV} must be set together"
-                ));
+                return Self::Invalid(format!("{INPUT_ENV} and {OUTPUT_ENV} must be set together"));
             }
         };
         let Some(input) = input.to_str() else {
@@ -228,7 +232,10 @@ impl ControlledResponseConfig {
         if max_input == 0 || max_output == 0 {
             return Self::Invalid("controlled response limits must be positive".to_string());
         }
-        Self::Enabled { max_input, max_output }
+        Self::Enabled {
+            max_input,
+            max_output,
+        }
     }
 }
 
@@ -1281,7 +1288,6 @@ impl ModelClientSession {
         let Some((max_input, max_output)) = self.controlled_response_limits()? else {
             return Ok(None);
         };
-        const FRAMING_RESERVE_TOKENS: u64 = 4096;
         if model_info.used_fallback_model_metadata || request.model != model_info.slug {
             return Err(self.client.state.provider.map_api_error(ApiError::Stream(
                 "controlled response mode requires verified metadata for the selected model"
@@ -1331,14 +1337,14 @@ impl ModelClientSession {
         request.parallel_tool_calls = false;
         request.max_output_tokens = Some(max_output);
         let encoded = serde_json::to_vec(request).map_err(|err| {
-            self.client.state.provider.map_api_error(ApiError::Stream(format!(
-                "failed to encode controlled response request: {err}"
-            )))
+            self.client
+                .state
+                .provider
+                .map_api_error(ApiError::Stream(format!(
+                    "failed to encode controlled response request: {err}"
+                )))
         })?;
-        let required_context = u64::try_from(encoded.len())
-            .ok()
-            .and_then(|input| input.checked_add(max_output))
-            .and_then(|total| total.checked_add(FRAMING_RESERVE_TOKENS))
+        let required_context = controlled_response_required_context(encoded.len(), max_output)
             .ok_or_else(|| {
                 self.client.state.provider.map_api_error(ApiError::Stream(
                     "controlled response context accounting overflowed".to_string(),
@@ -1350,10 +1356,14 @@ impl ModelClientSession {
             ))));
         }
         if encoded.len() > max_input {
-            return Err(self.client.state.provider.map_api_error(ApiError::Stream(format!(
-                "controlled response request is {} bytes, limit is {max_input}",
-                encoded.len()
-            ))));
+            return Err(self
+                .client
+                .state
+                .provider
+                .map_api_error(ApiError::Stream(format!(
+                    "controlled response request is {} bytes, limit is {max_input}",
+                    encoded.len()
+                ))));
         }
         Ok(Some(encoded.len()))
     }
@@ -1745,8 +1755,8 @@ impl ModelClientSession {
                 api_provider.retry.retry_transport = false;
             }
             let client = ApiResponsesClient::new(transport, api_provider, client_setup.api_auth)
-            .with_endpoint(endpoint)
-            .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+                .with_endpoint(endpoint)
+                .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
             let stream_result = client.stream_request(request, options).await;
 
             match stream_result {

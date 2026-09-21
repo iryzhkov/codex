@@ -1,4 +1,5 @@
 use super::AuthRequestTelemetryContext;
+use super::ControlledResponseConfig;
 use super::ModelClient;
 use super::PendingUnauthorizedRetry;
 use super::Prompt;
@@ -8,6 +9,7 @@ use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
+use super::controlled_response_required_context;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
@@ -98,113 +100,248 @@ use wiremock::matchers::path;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
-struct ControlledResponseEnv;
+struct ControlledResponseEnv {
+    input: Option<std::ffi::OsString>,
+    output: Option<std::ffi::OsString>,
+}
 
 impl ControlledResponseEnv {
-    fn set(max_input_bytes: &str) -> Self {
+    fn set(input: Option<&std::ffi::OsStr>, output: Option<&std::ffi::OsStr>) -> Self {
+        const INPUT_ENV: &str = "T3_CODEX_CONTROLLED_RESPONSE_MAX_INPUT_BYTES";
+        const OUTPUT_ENV: &str = "T3_CODEX_CONTROLLED_RESPONSE_MAX_OUTPUT_TOKENS";
+        let previous = Self {
+            input: std::env::var_os(INPUT_ENV),
+            output: std::env::var_os(OUTPUT_ENV),
+        };
         unsafe {
-            std::env::set_var("T3_CODEX_CONTROLLED_RESPONSE_MAX_INPUT_BYTES", max_input_bytes);
-            std::env::set_var("T3_CODEX_CONTROLLED_RESPONSE_MAX_OUTPUT_TOKENS", "512");
+            match input {
+                Some(value) => std::env::set_var(INPUT_ENV, value),
+                None => std::env::remove_var(INPUT_ENV),
+            }
+            match output {
+                Some(value) => std::env::set_var(OUTPUT_ENV, value),
+                None => std::env::remove_var(OUTPUT_ENV),
+            }
         }
-        Self
+        previous
+    }
+
+    fn enabled(max_input_bytes: &str) -> Self {
+        Self::set(
+            Some(std::ffi::OsStr::new(max_input_bytes)),
+            Some(std::ffi::OsStr::new("512")),
+        )
     }
 }
 
 impl Drop for ControlledResponseEnv {
     fn drop(&mut self) {
         unsafe {
-            std::env::remove_var("T3_CODEX_CONTROLLED_RESPONSE_MAX_INPUT_BYTES");
-            std::env::remove_var("T3_CODEX_CONTROLLED_RESPONSE_MAX_OUTPUT_TOKENS");
+            match &self.input {
+                Some(value) => {
+                    std::env::set_var("T3_CODEX_CONTROLLED_RESPONSE_MAX_INPUT_BYTES", value)
+                }
+                None => std::env::remove_var("T3_CODEX_CONTROLLED_RESPONSE_MAX_INPUT_BYTES"),
+            }
+            match &self.output {
+                Some(value) => {
+                    std::env::set_var("T3_CODEX_CONTROLLED_RESPONSE_MAX_OUTPUT_TOKENS", value)
+                }
+                None => std::env::remove_var("T3_CODEX_CONTROLLED_RESPONSE_MAX_OUTPUT_TOKENS"),
+            }
         }
     }
 }
 
-#[test]
-#[serial_test::serial(controlled_response_env)]
-fn controlled_response_enforces_request_limits_and_single_submission() {
-    let _env = ControlledResponseEnv::set("16384");
+fn controlled_response_client(max_input: usize, max_output: u64) -> ModelClient {
+    let mut client = test_model_client(SessionSource::Exec);
+    Arc::get_mut(&mut client.state)
+        .expect("test client state is uniquely owned")
+        .controlled_response_config = ControlledResponseConfig::Enabled {
+        max_input,
+        max_output,
+    };
+    client
+}
 
-    let client = test_model_client(SessionSource::Exec);
-    let mut session = client.new_session();
-    let prompt = Prompt::default();
-    let model_info = test_model_info();
+fn controlled_response_request(
+    client: &ModelClient,
+    model_info: &ModelInfo,
+) -> codex_api::ResponsesApiRequest {
     let metadata = test_responses_metadata_for_client(
-        &client,
+        client,
         Some("turn-test"),
         "window-test".to_string(),
         None,
         TestCodexResponsesRequestKind::Turn,
     );
-    let mut request = client
+    client
         .build_responses_request(
-            &prompt,
-            &model_info,
+            &Prompt::default(),
+            model_info,
             None,
             codex_protocol::config_types::ReasoningSummary::None,
             None,
             &metadata,
         )
-        .expect("request builds");
+        .expect("request builds")
+}
 
-    let encoded_len = session
-        .enforce_controlled_response(
-            &mut request,
-            &model_info,
-            false,
-            Some(CodexResponsesRequestKind::Turn),
-        )
-        .expect("first request is admitted")
+fn enforce_controlled_response(
+    client: &ModelClient,
+    request: &mut codex_api::ResponsesApiRequest,
+    model_info: &ModelInfo,
+) -> std::result::Result<Option<usize>, CodexErr> {
+    client.new_session().enforce_controlled_response(
+        request,
+        model_info,
+        false,
+        Some(CodexResponsesRequestKind::Turn),
+    )
+}
+
+#[test]
+fn controlled_response_enforces_exact_serialized_and_context_boundaries() {
+    let model_info = test_model_info();
+    let sizing_client = controlled_response_client(usize::MAX, 512);
+    let mut sizing_request = controlled_response_request(&sizing_client, &model_info);
+    sizing_request
+        .input
+        .push(output_message("escaped", "é\"\\"));
+    let encoded_len = enforce_controlled_response(&sizing_client, &mut sizing_request, &model_info)
+        .expect("sizing request is admitted")
         .expect("controlled mode is enabled");
-    assert!(encoded_len <= 16384);
-    assert!(request.tools.is_none());
-    assert_eq!(request.tool_choice, "none");
-    assert!(!request.parallel_tool_calls);
-    assert_eq!(request.max_output_tokens, Some(512));
+    assert_eq!(
+        encoded_len,
+        serde_json::to_vec(&sizing_request).unwrap().len()
+    );
+    assert!(
+        encoded_len
+            > serde_json::to_string(&sizing_request)
+                .unwrap()
+                .chars()
+                .count()
+    );
 
-    let mut second_session = client.new_session();
-    let second = second_session.enforce_controlled_response(
-            &mut request,
-            &model_info,
-            false,
-            Some(CodexResponsesRequestKind::Turn),
+    let required_context =
+        controlled_response_required_context(encoded_len, 512).expect("context fits in u64");
+    let mut boundary_model = test_model_info();
+    boundary_model.context_window = Some(i64::try_from(required_context).unwrap());
+    let boundary_client = controlled_response_client(encoded_len, 512);
+    let mut boundary_request = controlled_response_request(&boundary_client, &boundary_model);
+    boundary_request
+        .input
+        .push(output_message("escaped", "é\"\\"));
+    assert_eq!(
+        enforce_controlled_response(&boundary_client, &mut boundary_request, &boundary_model,)
+            .expect("exact boundary is admitted"),
+        Some(encoded_len),
+    );
+
+    let mut short_model = boundary_model.clone();
+    short_model.context_window = Some(i64::try_from(required_context - 1).unwrap());
+    let short_client = controlled_response_client(encoded_len, 512);
+    let mut short_request = controlled_response_request(&short_client, &short_model);
+    short_request.input.push(output_message("escaped", "é\"\\"));
+    assert!(
+        enforce_controlled_response(&short_client, &mut short_request, &short_model).is_err(),
+        "one context unit below the boundary must be refused",
+    );
+
+    let input_client = controlled_response_client(encoded_len - 1, 512);
+    let mut input_request = controlled_response_request(&input_client, &model_info);
+    input_request.input.push(output_message("escaped", "é\"\\"));
+    assert!(
+        enforce_controlled_response(&input_client, &mut input_request, &model_info).is_err(),
+        "one byte above the serialized-input limit must be refused",
+    );
+}
+
+#[test]
+fn controlled_response_context_accounting_detects_overflow() {
+    assert_eq!(controlled_response_required_context(1, u64::MAX), None);
+}
+
+#[test]
+fn controlled_response_rejects_unverified_or_mismatched_model_metadata() {
+    let cases = [
+        {
+            let mut model = test_model_info();
+            model.used_fallback_model_metadata = true;
+            model
+        },
+        {
+            let mut model = test_model_info();
+            model.slug = "other-model".to_string();
+            model
+        },
+        {
+            let mut model = test_model_info();
+            model.context_window = None;
+            model.max_context_window = None;
+            model
+        },
+        {
+            let mut model = test_model_info();
+            model.context_window = Some(0);
+            model
+        },
+    ];
+    for model_info in cases {
+        let client = controlled_response_client(16_384, 512);
+        let mut request = controlled_response_request(&client, &test_model_info());
+        assert!(
+            enforce_controlled_response(&client, &mut request, &model_info).is_err(),
+            "unverified, mismatched, missing, or zero context metadata must be refused",
         );
-    assert!(second.is_err(), "a second provider request must be refused");
+    }
+}
 
+#[test]
+fn controlled_response_rejects_output_budget_over_context() {
+    let mut model_info = test_model_info();
+    model_info.context_window = Some(8_192);
+    let client = controlled_response_client(16_384, u64::MAX - 4096);
+    let mut request = controlled_response_request(&client, &model_info);
+    assert!(enforce_controlled_response(&client, &mut request, &model_info).is_err());
+}
+
+#[test]
+fn controlled_response_fences_second_submission_across_sessions() {
+    let client = controlled_response_client(16_384, 512);
+    let model_info = test_model_info();
+    let mut request = controlled_response_request(&client, &model_info);
+    enforce_controlled_response(&client, &mut request, &model_info)
+        .expect("first request is admitted");
+    assert!(
+        enforce_controlled_response(&client, &mut request, &model_info).is_err(),
+        "a second provider request must be refused",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(controlled_response_env)]
+fn controlled_response_invalid_utf8_environment_fails_closed() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let invalid = std::ffi::OsString::from_vec(vec![0xff]);
+    let _env =
+        ControlledResponseEnv::set(Some(invalid.as_os_str()), Some(std::ffi::OsStr::new("512")));
+    let client = test_model_client(SessionSource::Exec);
+    let model_info = test_model_info();
+    let mut request = controlled_response_request(&client, &model_info);
+    assert!(enforce_controlled_response(&client, &mut request, &model_info).is_err());
 }
 
 #[test]
 #[serial_test::serial(controlled_response_env)]
-fn controlled_response_refuses_oversized_serialized_request() {
-    let _env = ControlledResponseEnv::set("1");
-
+fn controlled_response_missing_environment_pair_fails_closed() {
+    let _env = ControlledResponseEnv::set(Some(std::ffi::OsStr::new("16384")), None);
     let client = test_model_client(SessionSource::Exec);
-    let mut session = client.new_session();
-    let prompt = Prompt::default();
     let model_info = test_model_info();
-    let metadata = test_responses_metadata_for_client(
-        &client,
-        Some("turn-test"),
-        "window-test".to_string(),
-        None,
-        TestCodexResponsesRequestKind::Turn,
-    );
-    let mut request = client
-        .build_responses_request(
-            &prompt,
-            &model_info,
-            None,
-            codex_protocol::config_types::ReasoningSummary::None,
-            None,
-            &metadata,
-        )
-        .expect("request builds");
-    assert!(session.enforce_controlled_response(
-            &mut request,
-            &model_info,
-            false,
-            Some(CodexResponsesRequestKind::Turn),
-        ).is_err());
-
+    let mut request = controlled_response_request(&client, &model_info);
+    assert!(enforce_controlled_response(&client, &mut request, &model_info).is_err());
 }
 
 fn test_model_client(session_source: SessionSource) -> ModelClient {
@@ -366,7 +503,7 @@ fn responses_request_limits_raw_tool_metadata_to_resolved_first_party_https_endp
 }
 
 async fn assert_controlled_response_status_is_not_retried(status: u16) -> anyhow::Result<()> {
-    let _env = ControlledResponseEnv::set("16384");
+    let _env = ControlledResponseEnv::enabled("16384");
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
@@ -405,10 +542,20 @@ async fn assert_controlled_response_status_is_not_retried(status: u16) -> anyhow
         .await;
     assert!(result.is_err());
     assert_eq!(
-        server.received_requests().await.expect("received requests").len(),
+        server
+            .received_requests()
+            .await
+            .expect("received requests")
+            .len(),
         1
     );
     Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial(controlled_response_env)]
+async fn controlled_response_does_not_retry_401() -> anyhow::Result<()> {
+    assert_controlled_response_status_is_not_retried(401).await
 }
 
 #[tokio::test]
