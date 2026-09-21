@@ -1,0 +1,375 @@
+name: controlled-runtime-release
+
+on:
+  push:
+    tags:
+      - "controlled-v*-rc.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: controlled-runtime-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  EXPECTED_REPOSITORY: iryzhkov/codex
+  RUST_TOOLCHAIN: "1.95.0"
+  CODEX_ZSH_RELEASE_TAG: codex-zsh-v0.1.0
+  CODEX_ZSH_MANIFEST_SHA256: c534eab89dcea7e3d8a5e5b3f49c025c7c64cd4e4d9814ee24871de58a9359a1
+
+jobs:
+  quality-gate:
+    name: Validate source and test release inputs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    outputs:
+      version: ${{ steps.source.outputs.version }}
+      commit: ${{ steps.source.outputs.commit }}
+      tree: ${{ steps.source.outputs.tree }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate immutable release identity
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == "$EXPECTED_REPOSITORY" ]] ||
+            { echo "This workflow only publishes from $EXPECTED_REPOSITORY" >&2; exit 1; }
+          [[ "$GITHUB_REF_TYPE" == tag ]] ||
+            { echo "Release must run from a tag" >&2; exit 1; }
+          [[ "$GITHUB_REF_NAME" =~ ^controlled-v([0-9]+\.[0-9]+\.[0-9]+)-rc\.([1-9][0-9]*)$ ]] ||
+            { echo "Invalid controlled release tag: $GITHUB_REF_NAME" >&2; exit 1; }
+
+          version="${BASH_REMATCH[1]}"
+          cargo_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' codex-rs/Cargo.toml | head -1)"
+          [[ "$version" == "$cargo_version" ]] ||
+            { echo "Tag version $version does not match Cargo version $cargo_version" >&2; exit 1; }
+
+          tag_commit="$(git rev-list -n1 "$GITHUB_REF_NAME")"
+          [[ "$tag_commit" == "$GITHUB_SHA" ]] ||
+            { echo "Checked out commit does not match tag target" >&2; exit 1; }
+          if ! git diff --quiet || ! git diff --cached --quiet; then
+            echo "Checkout is not clean" >&2
+            exit 1
+          fi
+
+          {
+            echo "version=$version"
+            echo "commit=$(git rev-parse HEAD)"
+            echo "tree=$(git rev-parse 'HEAD^{tree}')"
+          } >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/setup-ci
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+      - name: Configure and verify rusty_v8 artifacts
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: x86_64-unknown-linux-gnu
+      - name: Check Rust formatting
+        working-directory: codex-rs
+        run: cargo fmt -- --config imports_granularity=Item --check
+      - name: Validate packaging scripts
+        run: |
+          set -euo pipefail
+          bash -n .github/scripts/build-codex-package-archive.sh
+          bash -n .github/scripts/install-musl-build-tools.sh
+          python3 -m py_compile scripts/build_codex_package.py third_party/voice/assemble_package.py third_party/voice/release_runtime.py
+      - name: Install full-suite runtime dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libcap-dev libasound2-dev bubblewrap \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-tools
+          gst-inspect-1.0 rtpjitterbuffer >/dev/null
+      - name: Run full workspace qualification
+        working-directory: codex-rs
+        env:
+          RUST_MIN_STACK: "8388608"
+        run: |
+          set -euo pipefail
+          just test
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: quality-gate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            expected_machine: Advanced Micro Devices X86-64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            expected_machine: AArch64
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - name: Use hermetic Cargo home
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_home="$RUNNER_TEMP/cargo-home"
+          mkdir -p "$cargo_home/bin"
+          : > "$cargo_home/config.toml"
+          echo "CARGO_HOME=$cargo_home" >> "$GITHUB_ENV"
+          echo "$cargo_home/bin" >> "$GITHUB_PATH"
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.0
+          use-cache: false
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends             binutils file jq pkg-config libcap-dev zstd
+      - name: Install musl build tools
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/install-musl-build-tools.sh"
+      - name: Configure and verify rusty_v8 artifacts
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: ${{ matrix.target }}
+      - name: Build Linux binaries
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          export AWS_LC_SYS_NO_JITTER_ENTROPY=1
+          target_no_jitter="AWS_LC_SYS_NO_JITTER_ENTROPY_${TARGET//-/_}"
+          export "$target_no_jitter=1"
+
+          cargo build --locked --release --target "$TARGET" --bin bwrap
+          bwrap="target/$TARGET/release/bwrap"
+          strip --strip-debug --strip-unneeded "$bwrap"
+          export CODEX_BWRAP_SHA256
+          CODEX_BWRAP_SHA256="$(sha256sum "$bwrap" | awk '{print $1}')"
+          export STABLE_GIT_COMMIT="${{ needs.quality-gate.outputs.commit }}"
+          cargo build --locked --release --target "$TARGET" --bin codex --bin codex-code-mode-host
+          strip --strip-debug --strip-unneeded \
+            "target/$TARGET/release/codex" \
+            "target/$TARGET/release/codex-code-mode-host"
+      - uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
+        with:
+          bazelisk-version: 1.28.1
+      - name: Build native voice runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            x86_64-unknown-linux-musl)
+              voice_target=x86_64-unknown-linux-gnu
+              prefix=linux_x86_64
+              ;;
+            aarch64-unknown-linux-musl)
+              voice_target=aarch64-unknown-linux-gnu
+              prefix=linux_aarch64
+              ;;
+            *) exit 1 ;;
+          esac
+
+          bazel build -c opt //codex-rs/voice-host:codex-voice-host //third_party/voice:native_runtime
+          source="bazel-bin/third_party/voice/native_runtime_${prefix}"
+          output="$RUNNER_TEMP/voice"
+          mkdir -p "$output"
+          python3 third_party/voice/release_runtime.py stage             --target "$voice_target" --source "$source" --output "$output/runtime"
+          cp bazel-bin/codex-rs/voice-host/codex-voice-host "$output/codex-voice-host"
+          chmod 0755 "$output/codex-voice-host"
+          python3 third_party/voice/release_runtime.py seal             --target "$voice_target" --output "$output/runtime"
+      - name: Fetch and verify upstream zsh manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="$RUNNER_TEMP/codex-zsh"
+          curl -fsSL             "https://github.com/openai/codex/releases/download/$CODEX_ZSH_RELEASE_TAG/codex-zsh"             -o "$manifest"
+          bash .github/scripts/verify-zsh-manifest.sh "$manifest" "$CODEX_ZSH_MANIFEST_SHA256"
+          echo "ZSH_MANIFEST=$manifest" >> "$GITHUB_ENV"
+      - name: Assemble controlled runtime bundle
+        shell: bash
+        env:
+          VERSION: ${{ needs.quality-gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          release_dir="codex-rs/target/$TARGET/release"
+          dist="$GITHUB_WORKSPACE/dist"
+          mkdir -p "$dist"
+          bash .github/scripts/build-codex-package-archive.sh             --target "$TARGET"             --bundle primary             --entrypoint-dir "$release_dir"             --archive-dir "$dist"             --zsh-manifest "$ZSH_MANIFEST"             --voice-release-dir "$RUNNER_TEMP/voice"             --release-version "$VERSION"
+
+          stem="codex-controlled-${GITHUB_REF_NAME#controlled-v}-$TARGET"
+          mv "$dist/codex-package-$TARGET.tar.zst" "$dist/$stem.tar.zst"
+          rm "$dist/codex-package-$TARGET.tar.gz"
+          echo "ASSET=$stem.tar.zst" >> "$GITHUB_ENV"
+      - name: Verify portability and write build receipt
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ needs.quality-gate.outputs.commit }}
+          SOURCE_TREE: ${{ needs.quality-gate.outputs.tree }}
+        run: |
+          set -euo pipefail
+          binary="codex-rs/target/$TARGET/release/codex"
+          readelf -h "$binary" | grep -F "Machine:" | grep -F "${{ matrix.expected_machine }}"
+          if readelf -d "$binary" 2>&1 | grep -q '(NEEDED)'; then
+            echo "The musl Codex entrypoint unexpectedly has dynamic dependencies" >&2
+            exit 1
+          fi
+
+          archive="$GITHUB_WORKSPACE/dist/$ASSET"
+          archive_sha="$(sha256sum "$archive" | awk '{print $1}')"
+          receipt="$GITHUB_WORKSPACE/dist/${ASSET%.tar.zst}.receipt.json"
+          extracted="$RUNNER_TEMP/receipt-tree"
+          mkdir -p "$extracted"
+          tar --zstd -xf "$archive" -C "$extracted"
+          if find "$extracted" -type l -o \( ! -type d ! -type f \) | grep -q .; then
+            echo "Package contains a link or non-regular member" >&2
+            exit 1
+          fi
+          CODEX_TEST_VOICE_RUNTIME="$extracted/codex-resources/voice" \
+            "$extracted/bin/codex" --version | grep -Fx "codex-cli ${{ needs.quality-gate.outputs.version }}"
+          voice_library_path="$(find "$extracted/codex-resources/voice" -type d -print0 | python3 -c 'import os,sys; print(os.pathsep.join(p.decode() for p in sys.stdin.buffer.read().split(b"\0") if p))')"
+          voice_ldd="$(LD_LIBRARY_PATH="$voice_library_path" ldd "$extracted/codex-resources/voice/bin/codex-voice-host")"
+          if grep -F 'not found' <<<"$voice_ldd"; then
+            echo "Voice host has unresolved native dependencies" >&2
+            exit 1
+          fi
+          voice_ldd_json="$(printf '%s\n' "$voice_ldd" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+          rustc_json="$(rustc -vV | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+          cargo_json="$(cargo -V | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))')"
+          python3 - "$receipt" "$extracted" <<PY
+          import hashlib
+          import json
+          from pathlib import Path
+          root = Path("$extracted")
+          files = {
+              path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in sorted(root.rglob("*"))
+              if path.is_file()
+          }
+          receipt = {
+              "schema": "codex-controlled-runtime-receipt-v1",
+              "repository": "$GITHUB_REPOSITORY",
+              "tag": "$GITHUB_REF_NAME",
+              "source_commit": "$SOURCE_COMMIT",
+              "source_tree": "$SOURCE_TREE",
+              "cargo_version": "${{ needs.quality-gate.outputs.version }}",
+              "target": "$TARGET",
+              "voice_target": "${TARGET%-musl}-gnu",
+              "runner_arch": "$RUNNER_ARCH",
+              "archive": "$ASSET",
+              "archive_sha256": "$archive_sha",
+              "rustc_vv": json.loads('$rustc_json'),
+              "cargo_v": json.loads('$cargo_json'),
+              "voice_host_ldd": json.loads('$voice_ldd_json'),
+              "rusty_v8_archive_sha256": "$(sha256sum "$RUSTY_V8_ARCHIVE" | awk '{print $1}')",
+              "rusty_v8_binding_sha256": "$(sha256sum "$RUSTY_V8_SRC_BINDING_PATH" | awk '{print $1}')",
+              "qualification_workflow": "$GITHUB_WORKFLOW",
+              "qualification_run_id": "$GITHUB_RUN_ID",
+              "qualification_run_attempt": "$GITHUB_RUN_ATTEMPT",
+              "files_sha256": files,
+          }
+          Path("$receipt").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+          PY
+          jq -e             --arg commit "$SOURCE_COMMIT"             --arg target "$TARGET"             --arg sha "$archive_sha"             '.source_commit == $commit and .target == $target and .archive_sha256 == $sha'             "$receipt" >/dev/null
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: controlled-runtime-${{ matrix.target }}
+          path: |
+            dist/*.tar.zst
+            dist/*.receipt.json
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish immutable prerelease
+    needs: [quality-gate, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: controlled-runtime-*
+          path: dist
+          merge-multiple: true
+      - name: Verify artifact set and checksums
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ needs.quality-gate.outputs.commit }}
+          SOURCE_TREE: ${{ needs.quality-gate.outputs.tree }}
+        run: |
+          set -euo pipefail
+          mapfile -t archives < <(find dist -maxdepth 1 -type f -name '*.tar.zst' -printf '%f\n' | sort)
+          mapfile -t receipts < <(find dist -maxdepth 1 -type f -name '*.receipt.json' -printf '%f\n' | sort)
+          [[ ${#archives[@]} -eq 2 && ${#receipts[@]} -eq 2 ]] ||
+            { echo "Expected two archives and two receipts" >&2; exit 1; }
+
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            asset="codex-controlled-${GITHUB_REF_NAME#controlled-v}-$target.tar.zst"
+            receipt="${asset%.tar.zst}.receipt.json"
+            [[ -f "dist/$asset" && -f "dist/$receipt" ]]
+            sha="$(sha256sum "dist/$asset" | awk '{print $1}')"
+            jq -e               --arg repository "$GITHUB_REPOSITORY"               --arg tag "$GITHUB_REF_NAME"               --arg commit "$SOURCE_COMMIT"               --arg tree "$SOURCE_TREE"               --arg target "$target"               --arg asset "$asset"               --arg sha "$sha"               '.repository == $repository and .tag == $tag and
+               .source_commit == $commit and .source_tree == $tree and .target == $target and
+               .archive == $asset and .archive_sha256 == $sha and
+               .qualification_workflow == "controlled-runtime-release" and
+               (.qualification_run_id | length > 0) and
+               (.files_sha256["bin/codex"] | length == 64)'               "dist/$receipt" >/dev/null
+          done
+          (cd dist && sha256sum -- ./*.tar.zst ./*.receipt.json | sed 's#  \./#  #' > SHA256SUMS)
+          (cd dist && sha256sum --check SHA256SUMS)
+      - name: Publish draft only after every gate passes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; refusing to mutate it" >&2
+            exit 1
+          fi
+
+          notes="$(cat <<EOF
+          Controlled Codex runtime built from commit ${{ needs.quality-gate.outputs.commit }}.
+
+          This prerelease is separate from upstream Codex releases and does not replace the default Codex installation. Verify the selected archive and receipt against SHA256SUMS before installation.
+          EOF
+          )"
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --prerelease \
+            --title "$GITHUB_REF_NAME" \
+            --notes "$notes"
+          cleanup_draft() {
+            gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes || true
+          }
+          trap cleanup_draft ERR
+          gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY"
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
+          trap - ERR
