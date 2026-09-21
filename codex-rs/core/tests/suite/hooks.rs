@@ -1803,8 +1803,10 @@ async fn async_hook_context_is_injected_into_the_active_turn() -> Result<()> {
 
     let test = test_codex()
         .with_pre_build_hook(|home| {
-            write_async_user_prompt_submit_hook(home, /*gated*/ false, /*one_shot*/ false)
-                .expect("write immediate async user prompt submit hook");
+            write_async_user_prompt_submit_hook(
+                home, /*gated*/ false, /*one_shot*/ false,
+            )
+            .expect("write immediate async user prompt submit hook");
         })
         .with_config(trust_discovered_hooks)
         .build(&server)

@@ -598,6 +598,7 @@ enum InitializedCredentialScenario {
     HashAlias,
 }
 
+#[cfg(unix)]
 async fn run_initialized_credential_scenario(
     scenario: InitializedCredentialScenario,
 ) -> Result<()> {
