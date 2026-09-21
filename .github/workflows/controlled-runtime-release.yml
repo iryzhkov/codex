@@ -179,15 +179,41 @@ jobs:
 
           cat >"$RUNNER_TEMP/voice-sdk-probe.c" <<'EOF'
           #include <gst/gst.h>
+          #include <stdio.h>
           int main(int argc, char **argv) {
+              if (argc != 2) {
+                  fprintf(stderr, "usage: voice-sdk-probe RUNTIME_ROOT\n");
+                  return 2;
+              }
               gst_init(&argc, &argv);
               guint major, minor, micro, nano;
               gst_version(&major, &minor, &micro, &nano);
-              if (major != GST_VERSION_MAJOR || minor != GST_VERSION_MINOR || micro != GST_VERSION_MICRO)
+              if (major != GST_VERSION_MAJOR || minor != GST_VERSION_MINOR || micro != GST_VERSION_MICRO) {
+                  fprintf(stderr, "runtime GStreamer %u.%u.%u differs from headers %u.%u.%u\n",
+                      major, minor, micro, GST_VERSION_MAJOR, GST_VERSION_MINOR, GST_VERSION_MICRO);
                   return 1;
+              }
+              const char *plugins[] = {
+                  "app", "audioconvert", "audioresample", "coreelements", "opus", "rtp", "rtpmanager"
+              };
+              for (gsize i = 0; i < G_N_ELEMENTS(plugins); i++) {
+                  char *path = g_strdup_printf("%s/lib/gstreamer-1.0/libgst%s.so", argv[1], plugins[i]);
+                  GError *error = NULL;
+                  GstPlugin *plugin = gst_plugin_load_file(path, &error);
+                  if (plugin == NULL) {
+                      fprintf(stderr, "failed to load %s: %s\n", path, error ? error->message : "unknown error");
+                      g_clear_error(&error);
+                      g_free(path);
+                      return 2;
+                  }
+                  gst_object_unref(plugin);
+                  g_free(path);
+              }
               GstElementFactory *factory = gst_element_factory_find("rtpjitterbuffer");
-              if (factory == NULL)
+              if (factory == NULL) {
+                  fprintf(stderr, "explicitly loaded rtpmanager did not register rtpjitterbuffer\n");
                   return 2;
+              }
               gst_object_unref(factory);
               return 0;
           }
@@ -195,10 +221,14 @@ jobs:
           # shellcheck disable=SC2046
           cc "$RUNNER_TEMP/voice-sdk-probe.c" -o "$RUNNER_TEMP/voice-sdk-probe" \
             $("$PKG_CONFIG" --cflags --libs gstreamer-1.0)
+          voice_runtime="$(dirname "$native_lib")"
+          test -f "$voice_runtime/runtime.json"
           export GST_PLUGIN_PATH="$native_lib/gstreamer-1.0"
           export GST_PLUGIN_SYSTEM_PATH=
           export GST_REGISTRY="$RUNNER_TEMP/voice-sdk-registry.bin"
-          LD_LIBRARY_PATH="$native_lib" "$RUNNER_TEMP/voice-sdk-probe"
+          export GST_REGISTRY_UPDATE=no
+          export GST_REGISTRY_FORK=no
+          LD_LIBRARY_PATH="$native_lib" "$RUNNER_TEMP/voice-sdk-probe" "$voice_runtime"
 
           {
             echo "PKG_CONFIG=$PKG_CONFIG"
@@ -206,6 +236,9 @@ jobs:
             echo "GST_PLUGIN_PATH=$GST_PLUGIN_PATH"
             echo "GST_PLUGIN_SYSTEM_PATH=$GST_PLUGIN_SYSTEM_PATH"
             echo "GST_REGISTRY=$GST_REGISTRY"
+            echo "GST_REGISTRY_UPDATE=$GST_REGISTRY_UPDATE"
+            echo "GST_REGISTRY_FORK=$GST_REGISTRY_FORK"
+            echo "CODEX_TEST_VOICE_RUNTIME=$voice_runtime"
             for key in GLIB_2_0 GOBJECT_2_0 GIO_2_0 GSTREAMER_1_0 GSTREAMER_BASE_1_0 GSTREAMER_APP_1_0 GSTREAMER_AUDIO_1_0; do
               echo "SYSTEM_DEPS_${key}_SEARCH_NATIVE=$native_lib"
             done
