@@ -1367,8 +1367,10 @@ impl ModelClientSession {
                 .provider
                 .map_api_error(ApiError::Stream(message))
         })? {
-            if !matches!(self.client.state.session_source, SessionSource::Exec)
-                || model_info.used_fallback_model_metadata
+            if !matches!(
+                self.client.state.session_source,
+                SessionSource::Exec | SessionSource::VSCode
+            ) || model_info.used_fallback_model_metadata
                 || request.model != model_info.slug
             {
                 return Err(self.client.state.provider.map_api_error(ApiError::Stream(
