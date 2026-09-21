@@ -1578,7 +1578,7 @@ impl Session {
                     attestation_provider,
                     config.http_client_factory(),
                 )
-                .with_bounded_read_session(bounded_read_session)
+                .with_bounded_read_session(bounded_read_session.clone())
                 .with_free_guardian_enabled(config.free_guardian_enabled())
                 .with_session_context(
                     crate::guardian::prompt_cache_key_override_for_review_session(
@@ -1707,9 +1707,11 @@ impl Session {
                 mcp_runtime_cwd,
             )
             .await?;
-            sess.start_mcp_prewarm_worker(mcp_prewarm_rx, mcp_auth_changes);
-            sess.schedule_startup_prewarm(sess.get_prompt_base_instructions().await.text)
-                .await;
+            if bounded_read_session.is_none() {
+                sess.start_mcp_prewarm_worker(mcp_prewarm_rx, mcp_auth_changes);
+                sess.schedule_startup_prewarm(sess.get_prompt_base_instructions().await.text)
+                    .await;
+            }
             let session_start_source = match &initial_history {
                 InitialHistory::Forked(_) if forked_from_id.is_some() => {
                     codex_hooks::SessionStartSource::Fork

@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use codex_core::TurnInputRequest;
+use codex_features::Feature;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
@@ -235,12 +236,38 @@ async fn bounded_read_performs_exactly_two_posts_with_one_custody_tool() -> Resu
             vec!["read_custodied_page"]
         );
         assert_eq!(request.body_json()["parallel_tool_calls"], false);
+        assert_eq!(request.body_json()["tool_choice"], "auto");
     }
     let second = requests[1].body_json().to_string();
     assert!(second.contains("custodied evidence") || second.contains("Y3VzdG9kaWVkIGV2aWRlbmNl"));
     assert!(second.contains(artifact_id));
     assert!(!second.contains("artifact.txt"));
     assert!(!second.contains("manifest.json"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(bounded_read_env)]
+async fn bounded_startup_skips_model_prewarm_before_user_input() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let _env = custody_env(&dir, "artifact", b"evidence");
+    let server = start_mock_server().await;
+    let fixture = test_codex()
+        .with_model("gpt-5.4")
+        .with_config(|config| {
+            config.features.enable(Feature::CodeModePrewarm).unwrap();
+        })
+        .build(&server)
+        .await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+    drop(fixture);
     Ok(())
 }
 
@@ -315,36 +342,56 @@ async fn second_user_turn_is_rejected_before_another_post() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let _env = custody_env(&dir, "artifact", b"evidence");
     let server = start_mock_server().await;
-    let responses = mount_sse_sequence(
+    let responses = mount_response_once(
         &server,
-        vec![sse(vec![
+        sse_response(sse(vec![
             ev_response_created("resp-1"),
             ev_assistant_message("msg-1", "done"),
             ev_completed("resp-1"),
-        ])],
+        ]))
+        .set_delay(Duration::from_millis(250)),
     )
     .await;
     let fixture = test_codex().with_model("gpt-5.4").build(&server).await?;
-    for text in ["first", "second"] {
-        fixture
-            .codex
-            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-                text: text.into(),
-                text_elements: Vec::new(),
-            }]))
-            .await?;
-        let terminal = wait_for_event(&fixture.codex, |event| {
-            matches!(event, EventMsg::TurnComplete(_) | EventMsg::Error(_))
-        })
-        .await;
-        if text == "first" {
-            assert!(matches!(terminal, EventMsg::TurnComplete(_)));
-        } else {
-            assert!(matches!(terminal, EventMsg::Error(_)));
-            assert!(format!("{terminal:?}").contains("budget-exhausted"));
+    fixture
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "first".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    for _ in 0..1_000 {
+        if responses.requests().len() == 1 {
+            break;
         }
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
+    assert_eq!(
+        responses.requests().len(),
+        1,
+        "first request never reached server"
+    );
+    let error = fixture
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "steer while active".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("budget-exhausted"));
+    let terminal = wait_for_event(&fixture.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_) | EventMsg::Error(_))
+    })
+    .await;
+    assert!(matches!(terminal, EventMsg::TurnComplete(_)));
     assert_eq!(responses.requests().len(), 1);
+    assert!(
+        !responses.requests()[0]
+            .body_json()
+            .to_string()
+            .contains("steer while active")
+    );
     Ok(())
 }
 

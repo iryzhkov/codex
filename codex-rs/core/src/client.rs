@@ -1406,6 +1406,7 @@ impl ModelClientSession {
             request.instructions.clear();
             request.access_programs = None;
             request.parallel_tool_calls = false;
+            request.tool_choice = "auto".to_string();
             request.max_output_tokens = Some(crate::bounded_read::MAX_OUTPUT_TOKENS);
             let encoded = serde_json::to_vec(request).map_err(|error| {
                 self.client

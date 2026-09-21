@@ -232,6 +232,18 @@ impl BoundedReadSession {
         })
     }
 
+    pub(crate) fn ensure_user_turn_not_started(&self) -> Result<(), BoundedReadError> {
+        self.check_deadline()?;
+        let state = self
+            .admission
+            .lock()
+            .map_err(|_| invalid("admission lock poisoned"))?;
+        if state.user_turn_started {
+            return Err(BoundedReadError::BudgetExhausted);
+        }
+        Ok(())
+    }
+
     pub(crate) fn begin_user_turn(&self) -> Result<(), BoundedReadError> {
         self.check_deadline()?;
         let mut state = self
@@ -359,35 +371,16 @@ impl BoundedReadSession {
         if request.get("parallel_tool_calls") != Some(&serde_json::Value::Bool(false)) {
             return Err(invalid("bounded request permits no parallel tool calls"));
         }
+        if request.get("tool_choice") != Some(&serde_json::Value::String("auto".to_string())) {
+            return Err(invalid("bounded request requires automatic tool choice"));
+        }
         let tools = request
             .get("tools")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| invalid("bounded request tools are missing"))?;
-        let [tool] = tools.as_slice() else {
-            return Err(invalid("bounded request must expose exactly one tool"));
-        };
-        let parameters = tool
-            .get("parameters")
-            .and_then(serde_json::Value::as_object)
-            .ok_or_else(|| invalid("bounded read tool parameters are missing"))?;
-        let properties = parameters
-            .get("properties")
-            .and_then(serde_json::Value::as_object)
-            .ok_or_else(|| invalid("bounded read tool properties are missing"))?;
-        let required = parameters
-            .get("required")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| invalid("bounded read tool required fields are missing"))?;
-        let exact_tool = tool.get("type").and_then(serde_json::Value::as_str) == Some("function")
-            && tool.get("name").and_then(serde_json::Value::as_str) == Some("read_custodied_page")
-            && tool.get("strict") == Some(&serde_json::Value::Bool(true))
-            && parameters.get("type").and_then(serde_json::Value::as_str) == Some("object")
-            && parameters.get("additionalProperties") == Some(&serde_json::Value::Bool(false))
-            && properties.len() == 2
-            && properties.contains_key("artifact_id")
-            && properties.contains_key("cursor")
-            && required.as_slice() == [serde_json::Value::String("artifact_id".to_string())];
-        if !exact_tool {
+        let expected = serde_json::to_value([ToolSpec::Function(bounded_read_tool())])
+            .map_err(|error| invalid(format!("bounded tool schema serialization: {error}")))?;
+        if serde_json::Value::Array(tools.clone()) != expected {
             return Err(invalid("bounded request tool schema mismatch"));
         }
         Ok(())
@@ -462,39 +455,43 @@ impl BoundedReadHandler {
     }
 }
 
+fn bounded_read_tool() -> ResponsesApiTool {
+    let properties = BTreeMap::from([
+        (
+            "artifact_id".to_string(),
+            JsonSchema::string(Some(
+                "Custodied artifact identifier from the request package.".to_string(),
+            )),
+        ),
+        (
+            "cursor".to_string(),
+            JsonSchema::string(Some(
+                "Opaque cursor returned by the preceding page.".to_string(),
+            )),
+        ),
+    ]);
+    ResponsesApiTool {
+        name: "read_custodied_page".to_string(),
+        description: "Read one bounded page from an allowlisted custodied request artifact."
+            .to_string(),
+        strict: true,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["artifact_id".to_string()]),
+            Some(false.into()),
+        ),
+        output_schema: None,
+    }
+}
+
 impl ToolExecutor<ToolInvocation> for BoundedReadHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain("read_custodied_page")
     }
 
     fn spec(&self) -> ToolSpec {
-        let properties = BTreeMap::from([
-            (
-                "artifact_id".to_string(),
-                JsonSchema::string(Some(
-                    "Custodied artifact identifier from the request package.".to_string(),
-                )),
-            ),
-            (
-                "cursor".to_string(),
-                JsonSchema::string(Some(
-                    "Opaque cursor returned by the preceding page.".to_string(),
-                )),
-            ),
-        ]);
-        ToolSpec::Function(ResponsesApiTool {
-            name: "read_custodied_page".to_string(),
-            description: "Read one bounded page from an allowlisted custodied request artifact."
-                .to_string(),
-            strict: true,
-            defer_loading: None,
-            parameters: JsonSchema::object(
-                properties,
-                Some(vec!["artifact_id".to_string()]),
-                Some(false.into()),
-            ),
-            output_schema: None,
-        })
+        ToolSpec::Function(bounded_read_tool())
     }
 
     fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
@@ -880,48 +877,47 @@ mod tests {
     #[test]
     fn provider_request_requires_exact_single_custody_tool() {
         let (_dir, session) = fixture();
-        let tool = json!({
-            "type": "function",
-            "name": "read_custodied_page",
-            "description": "Read one bounded page from an allowlisted custodied request artifact.",
-            "strict": true,
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "artifact_id": {"type": "string"},
-                    "cursor": {"type": "string"}
-                },
-                "required": ["artifact_id"],
-                "additionalProperties": false
-            }
-        });
-        let encode = |tools: serde_json::Value| {
+        let tool = serde_json::to_value(ToolSpec::Function(bounded_read_tool())).unwrap();
+        let encode = |tools: serde_json::Value, tool_choice: &str| {
             serde_json::to_vec(&json!({
                 "parallel_tool_calls": false,
+                "tool_choice": tool_choice,
                 "tools": tools
             }))
             .unwrap()
         };
         assert!(
             session
-                .validate_provider_request(&encode(json!([tool.clone()])))
+                .validate_provider_request(&encode(json!([tool.clone()]), "auto"))
                 .is_ok()
         );
         assert!(
             session
-                .validate_provider_request(&encode(json!([])))
+                .validate_provider_request(&encode(json!([]), "auto"))
                 .is_err()
         );
         assert!(
             session
-                .validate_provider_request(&encode(json!([tool.clone(), tool.clone()])))
+                .validate_provider_request(&encode(json!([tool.clone(), tool.clone()]), "auto"))
                 .is_err()
         );
-        let mut wrong = tool;
-        wrong["name"] = json!("exec_command");
+        let mut wrong_name = tool.clone();
+        wrong_name["name"] = json!("exec_command");
         assert!(
             session
-                .validate_provider_request(&encode(json!([wrong])))
+                .validate_provider_request(&encode(json!([wrong_name]), "auto"))
+                .is_err()
+        );
+        let mut wrong_schema = tool.clone();
+        wrong_schema["parameters"]["properties"]["cursor"]["description"] = json!("changed");
+        assert!(
+            session
+                .validate_provider_request(&encode(json!([wrong_schema]), "auto"))
+                .is_err()
+        );
+        assert!(
+            session
+                .validate_provider_request(&encode(json!([tool]), "required"))
                 .is_err()
         );
     }

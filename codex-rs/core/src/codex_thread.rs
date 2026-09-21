@@ -464,6 +464,17 @@ impl CodexThread {
         request: TurnInputRequest,
         mode: TurnInputMode,
     ) -> CodexResult<TurnInputSubmission> {
+        if let Some(bounded) = self
+            .session
+            .services
+            .model_client
+            .bounded_read_session()
+            .map_err(CodexErr::InvalidRequest)?
+        {
+            bounded
+                .ensure_user_turn_not_started()
+                .map_err(|error| CodexErr::InvalidRequest(format!("{}: {error}", error.code())))?;
+        }
         if !matches!(mode, TurnInputMode::Steer { .. }) {
             self.session
                 .services
