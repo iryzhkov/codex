@@ -22,6 +22,9 @@ max-threads = 1
 [test-groups.app_server_integration_local]
 max-threads = 4
 
+[test-groups.app_server_login_port]
+max-threads = 1
+
 [test-groups.core_apply_patch_cli_integration]
 max-threads = 1
 
@@ -56,9 +59,15 @@ filter = 'package(codex-app-server) & kind(test)'
 test-group = 'app_server_integration'
 
 [[profile.local.overrides]]
-# Use up to four app-server subprocesses locally. The global nextest pool still
-# limits this to the machine's logical CPU count.
-filter = 'package(codex-app-server) & kind(test)'
+# These tests bind the same fixed login callback port. Nextest runs each test in
+# a separate process, beyond the reach of their in-process serial_test lock.
+filter = 'package(codex-app-server) & (test(=suite::v2::account::login_account_chatgpt_start_can_be_cancelled) | test(=suite::v2::account::login_account_chatgpt_uses_oauth_overrides) | test(=suite::v2::account::login_account_chatgpt_redirects_to_hosted_success_page) | test(=suite::v2::account::set_auth_token_cancels_active_chatgpt_login) | test(=suite::v2::account::login_account_chatgpt_includes_forced_workspace_query_param) | test(=suite::v2::account::login_account_chatgpt_includes_forced_workspace_allowlist_query_param))'
+test-group = 'app_server_login_port'
+
+[[profile.local.overrides]]
+# Use up to four other app-server subprocesses locally. The global nextest pool
+# still limits this to the machine's logical CPU count.
+filter = 'package(codex-app-server) & kind(test) & not (test(=suite::v2::account::login_account_chatgpt_start_can_be_cancelled) | test(=suite::v2::account::login_account_chatgpt_uses_oauth_overrides) | test(=suite::v2::account::login_account_chatgpt_redirects_to_hosted_success_page) | test(=suite::v2::account::set_auth_token_cancels_active_chatgpt_login) | test(=suite::v2::account::login_account_chatgpt_includes_forced_workspace_query_param) | test(=suite::v2::account::login_account_chatgpt_includes_forced_workspace_allowlist_query_param))'
 test-group = 'app_server_integration_local'
 
 [[profile.default.overrides]]
