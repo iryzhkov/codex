@@ -996,13 +996,16 @@ async fn run_snapshot_wrapper_scenario(scenario: SnapshotWrapperScenario) -> any
         wrap_brokered_snapshot(&shell, snapshot, env, &no_prepends)
     };
     let readonly_snapshot = dir.path().join("readonly-env-snapshot.sh").abs();
-    for initial_env in [None, Some("production"), Some(startup.to_str().unwrap())] {
+    let startup_text = startup
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("temporary startup path must be UTF-8"))?;
+    for initial_env in [None, Some("production"), Some(startup_text)] {
         let mut case_env = env.clone();
         case_env.remove("ENV");
         if let Some(value) = initial_env {
             case_env.insert("ENV".to_string(), value.to_string());
         }
-        for (value, succeeds) in [(startup.to_str().unwrap(), false), ("production", true)] {
+        for (value, succeeds) in [(startup_text, false), ("production", true)] {
             std::fs::write(
                 &readonly_snapshot,
                 format!("export ENV='{value}'\nreadonly ENV\n"),
