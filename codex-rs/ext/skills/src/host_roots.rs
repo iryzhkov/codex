@@ -15,6 +15,7 @@ use codex_skills::system_cache_root_dir;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_utils_plugins::PluginSkillRoot;
+#[cfg(not(test))]
 use dirs::home_dir;
 use futures::StreamExt;
 use toml::Value as TomlValue;
@@ -32,8 +33,13 @@ pub(crate) async fn resolve_skill_roots(
     plugin_skill_roots: Vec<PluginSkillRoot>,
     extra_skill_roots: Vec<AbsolutePathBuf>,
 ) -> Vec<HostSkillRoot> {
+    #[cfg(not(test))]
     let home_dir =
         home_dir().and_then(|path| AbsolutePathBuf::from_absolute_path_checked(path).ok());
+    // Unit fixtures must not discover skills from the developer's real home.
+    // Home-root discovery is covered with an explicit home in resolver tests.
+    #[cfg(test)]
+    let home_dir: Option<AbsolutePathBuf> = None;
     resolve_skill_roots_with_home_dir(
         repository_file_system,
         config_layer_stack,
