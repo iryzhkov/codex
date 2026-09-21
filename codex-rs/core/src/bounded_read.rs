@@ -872,6 +872,65 @@ mod tests {
     }
 
     #[test]
+    fn second_user_turn_is_refused_by_shared_session_state() {
+        let (_dir, session) = fixture();
+        assert!(session.begin_user_turn().is_ok());
+        assert_eq!(
+            session.begin_user_turn().unwrap_err().code(),
+            "budget-exhausted"
+        );
+    }
+
+    #[test]
+    fn provider_request_requires_exact_single_custody_tool() {
+        let (_dir, session) = fixture();
+        let tool = json!({
+            "type": "function",
+            "name": "read_custodied_page",
+            "description": "Read one bounded page from an allowlisted custodied request artifact.",
+            "strict": true,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "artifact_id": {"type": "string"},
+                    "cursor": {"type": "string"}
+                },
+                "required": ["artifact_id"],
+                "additionalProperties": false
+            }
+        });
+        let encode = |tools: serde_json::Value| {
+            serde_json::to_vec(&json!({
+                "parallel_tool_calls": false,
+                "tools": tools
+            }))
+            .unwrap()
+        };
+        assert!(
+            session
+                .validate_provider_request(&encode(json!([tool.clone()])))
+                .is_ok()
+        );
+        assert!(
+            session
+                .validate_provider_request(&encode(json!([])))
+                .is_err()
+        );
+        assert!(
+            session
+                .validate_provider_request(&encode(json!([tool.clone(), tool.clone()])))
+                .is_err()
+        );
+        let mut wrong = tool;
+        wrong["name"] = json!("exec_command");
+        assert!(
+            session
+                .validate_provider_request(&encode(json!([wrong])))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn custody_rejects_digest_binding_traversal_duplicates_and_symlinks() {
         let (dir, _session) = fixture();
         let manifest_path = dir.path().join("manifest.json");
