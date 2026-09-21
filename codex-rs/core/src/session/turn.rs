@@ -152,6 +152,15 @@ async fn run_bounded_read_turn(
     input: Vec<TurnInput>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<Option<String>> {
+    let bounded = sess
+        .services
+        .model_client
+        .bounded_read_session()
+        .map_err(CodexErr::Fatal)?
+        .ok_or_else(|| CodexErr::Fatal("bounded read session disappeared".to_string()))?;
+    bounded
+        .begin_user_turn()
+        .map_err(|error| CodexErr::Fatal(format!("{}: {error}", error.code())))?;
     let step_context = sess
         .capture_step_context_with_required_mcp_servers(
             Arc::clone(&turn_context),
@@ -171,6 +180,9 @@ async fn run_bounded_read_turn(
         )
         .await;
     }
+    let turn_store = Arc::new(codex_extension_api::ExtensionData::new(
+        turn_context.sub_id.clone(),
+    ));
     let mut client_session = sess.services.model_client.new_session();
     loop {
         let input = sess
@@ -180,17 +192,25 @@ async fn run_bounded_read_turn(
         let responses_metadata = sess
             .responses_metadata(turn_context.as_ref(), CodexResponsesRequestKind::Turn)
             .await;
-        let (output, _) = run_sampling_request(
+        let remaining = bounded
+            .remaining()
+            .map_err(|error| CodexErr::Fatal(format!("{}: {error}", error.code())))?;
+        let sampling = Box::pin(run_sampling_request(
             Arc::clone(&sess),
             Arc::clone(&step_context),
-            Arc::clone(&turn_context.extension_data),
+            Arc::clone(&turn_store),
             Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
             &mut client_session,
             &responses_metadata,
             input,
             cancellation_token.child_token(),
-        )
-        .await?;
+            /*bounded_read*/ true,
+        ));
+        let (output, _) = tokio::time::timeout(remaining, sampling)
+            .await
+            .map_err(|_| {
+                CodexErr::Fatal("deadline-exceeded: bounded read deadline exceeded".to_string())
+            })??;
         if !output.needs_follow_up {
             return Ok(output.last_agent_message);
         }
@@ -588,6 +608,7 @@ pub(crate) async fn run_turn(
                 &responses_metadata,
                 sampling_request_input,
                 cancellation_token.child_token(),
+                /*bounded_read*/ false,
             )
             .await
         }
@@ -1603,6 +1624,7 @@ async fn run_sampling_request(
     responses_metadata: &CodexResponsesMetadata,
     input: Vec<ResponseItem>,
     cancellation_token: CancellationToken,
+    bounded_read: bool,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
     let turn_context = Arc::clone(&step_context.turn);
     let base_instructions = sess.get_prompt_base_instructions().await;
@@ -1612,11 +1634,15 @@ async fn run_sampling_request(
         Arc::clone(&step_context),
         Arc::clone(&turn_diff_tracker),
     );
-    let _code_mode_worker = sess.services.code_mode_service.start_turn_worker(
-        &sess,
-        Arc::clone(&step_context),
-        Arc::clone(&turn_diff_tracker),
-    );
+    let _code_mode_worker = if bounded_read {
+        None
+    } else {
+        Some(sess.services.code_mode_service.start_turn_worker(
+            &sess,
+            Arc::clone(&step_context),
+            Arc::clone(&turn_diff_tracker),
+        ))
+    };
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retry_state = ResponsesStreamRetryState::default();
     let mut initial_input = Some(input);
@@ -1662,6 +1688,7 @@ async fn run_sampling_request(
             Arc::clone(&turn_diff_tracker),
             &prompt,
             cancellation_token.child_token(),
+            bounded_read,
         )
         .await
         {
@@ -1688,7 +1715,7 @@ async fn run_sampling_request(
             original_input = Some(prompt.input);
         }
 
-        if client_session.controlled_response_enabled() || !err.is_retryable() {
+        if bounded_read || client_session.controlled_response_enabled() || !err.is_retryable() {
             return Err(err);
         }
 
@@ -2512,6 +2539,7 @@ async fn try_run_sampling_request(
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
     cancellation_token: CancellationToken,
+    bounded_read: bool,
 ) -> CodexResult<SamplingRequestResult> {
     let turn_context = Arc::clone(&step_context.turn);
     feedback_tags!(
@@ -2573,11 +2601,11 @@ async fn try_run_sampling_request(
             .as_ref())
         .map(std::string::ToString::to_string)
         .unwrap_or_else(|| "default".to_string());
-    let plan_mode = turn_context.mode() == ModeKind::Plan;
+    let plan_mode = !bounded_read && turn_context.mode() == ModeKind::Plan;
     let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
-    let defer_streamed_turn_items_for_contributors =
-        !sess.services.extensions.turn_item_contributors().is_empty();
+    let defer_streamed_turn_items_for_contributors = !bounded_read
+        && !sess.services.extensions.turn_item_contributors().is_empty();
     let mut active_item_is_streaming_to_client = false;
     let receiving_span = trace_span!("receiving_stream");
     let outcome: CodexResult<SamplingRequestResult> = loop {
@@ -2610,7 +2638,17 @@ async fn try_run_sampling_request(
 
         let event = match event {
             Some(Ok(event)) => event,
+            Some(Err(_)) if bounded_read => {
+                break Err(CodexErr::Stream(
+                    "recovery-required: bounded read stream outcome is ambiguous".to_string(),
+                ));
+            }
             Some(Err(err)) => break Err(err),
+            None if bounded_read => {
+                break Err(CodexErr::Stream(
+                    "recovery-required: bounded read stream outcome is ambiguous".to_string(),
+                ));
+            }
             None => {
                 break Err(CodexErr::Stream(
                     "stream closed before response.completed".into(),

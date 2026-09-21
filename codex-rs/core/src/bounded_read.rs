@@ -24,7 +24,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
-use std::time::Instant;
+use tokio::time::Instant;
 
 pub(crate) const MAX_PROVIDER_REQUESTS: u8 = 4;
 pub(crate) const MAX_PROVIDER_REQUEST_BYTES: usize = 32_000;
@@ -111,6 +111,7 @@ struct Admission {
     tool_bytes: usize,
     issued_cursors: BTreeMap<String, Cursor>,
     consumed_cursors: HashSet<String>,
+    user_turn_started: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -231,6 +232,25 @@ impl BoundedReadSession {
         })
     }
 
+    pub(crate) fn begin_user_turn(&self) -> Result<(), BoundedReadError> {
+        self.check_deadline()?;
+        let mut state = self
+            .admission
+            .lock()
+            .map_err(|_| invalid("admission lock poisoned"))?;
+        if state.user_turn_started {
+            return Err(BoundedReadError::BudgetExhausted);
+        }
+        state.user_turn_started = true;
+        Ok(())
+    }
+
+    pub(crate) fn remaining(&self) -> Result<Duration, BoundedReadError> {
+        DEADLINE
+            .checked_sub(self.started_at.elapsed())
+            .ok_or(BoundedReadError::DeadlineExceeded)
+    }
+
     pub(crate) fn read_page(
         &self,
         artifact_id: &str,
@@ -333,6 +353,50 @@ impl BoundedReadSession {
         Ok(())
     }
 
+    pub(crate) fn validate_provider_request(
+        &self,
+        encoded: &[u8],
+    ) -> Result<(), BoundedReadError> {
+        let request: serde_json::Value = serde_json::from_slice(encoded)
+            .map_err(|error| invalid(format!("provider request JSON: {error}")))?;
+        if request.get("parallel_tool_calls") != Some(&serde_json::Value::Bool(false)) {
+            return Err(invalid("bounded request permits no parallel tool calls"));
+        }
+        let tools = request
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| invalid("bounded request tools are missing"))?;
+        let [tool] = tools.as_slice() else {
+            return Err(invalid("bounded request must expose exactly one tool"));
+        };
+        let parameters = tool
+            .get("parameters")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| invalid("bounded read tool parameters are missing"))?;
+        let properties = parameters
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| invalid("bounded read tool properties are missing"))?;
+        let required = parameters
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| invalid("bounded read tool required fields are missing"))?;
+        let exact_tool = tool.get("type").and_then(serde_json::Value::as_str) == Some("function")
+            && tool.get("name").and_then(serde_json::Value::as_str)
+                == Some("read_custodied_page")
+            && tool.get("strict") == Some(&serde_json::Value::Bool(true))
+            && parameters.get("type").and_then(serde_json::Value::as_str) == Some("object")
+            && parameters.get("additionalProperties") == Some(&serde_json::Value::Bool(false))
+            && properties.len() == 2
+            && properties.contains_key("artifact_id")
+            && properties.contains_key("cursor")
+            && required.as_slice() == [serde_json::Value::String("artifact_id".to_string())];
+        if !exact_tool {
+            return Err(invalid("bounded request tool schema mismatch"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn admit_provider_request(
         &self,
         serialized_len: usize,
@@ -368,11 +432,7 @@ impl BoundedReadSession {
     }
 
     fn check_deadline(&self) -> Result<(), BoundedReadError> {
-        if self.started_at.elapsed() > DEADLINE {
-            Err(BoundedReadError::DeadlineExceeded)
-        } else {
-            Ok(())
-        }
+        self.remaining().map(|_| ())
     }
 
     fn cursor_token(&self, artifact_id: &str, offset: u64) -> String {

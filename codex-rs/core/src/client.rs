@@ -510,18 +510,7 @@ impl ModelClient {
             collect_auth_env_telemetry(model_provider.info(), codex_api_key_env_enabled);
         let include_attestation = model_provider.supports_attestation();
         let controlled_response_config = ControlledResponseConfig::from_env();
-        let mut bounded_read_session =
-            crate::bounded_read::BoundedReadSession::from_env().map_err(|error| error.to_string());
-        if !matches!(
-            controlled_response_config,
-            ControlledResponseConfig::Disabled
-        ) && matches!(bounded_read_session, Ok(Some(_)))
-        {
-            bounded_read_session = Err(
-                "one-shot controlled response and bounded read modes are mutually exclusive"
-                    .to_string(),
-            );
-        }
+        let bounded_read_session = Ok(None);
         Self {
             state: Arc::new(ModelClientState {
                 thread_id,
@@ -550,6 +539,24 @@ impl ModelClient {
             event_sender: None,
             http_client_factory,
         }
+    }
+
+    pub(crate) fn with_bounded_read_session(
+        mut self,
+        bounded_read_session: Option<Arc<crate::bounded_read::BoundedReadSession>>,
+    ) -> Self {
+        let state = Arc::get_mut(&mut self.state)
+            .expect("bounded read session must be installed before ModelClient is shared");
+        state.bounded_read_session = if !matches!(
+            state.controlled_response_config,
+            ControlledResponseConfig::Disabled
+        ) && bounded_read_session.is_some()
+        {
+            Err("one-shot controlled response and bounded read modes are mutually exclusive".into())
+        } else {
+            Ok(bounded_read_session)
+        };
+        self
     }
 
     pub(crate) fn with_free_guardian_enabled(mut self, free_guardian_enabled: bool) -> Self {
@@ -1407,6 +1414,12 @@ impl ModelClientSession {
                     .map_api_error(ApiError::Stream(format!(
                         "failed to encode bounded read request: {error}"
                     )))
+            })?;
+            bounded.validate_provider_request(&encoded).map_err(|error| {
+                self.client
+                    .state
+                    .provider
+                    .map_api_error(ApiError::Stream(format!("{}: {error}", error.code())))
             })?;
             bounded
                 .admit_provider_request(encoded.len(), context_window)
