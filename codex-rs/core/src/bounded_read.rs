@@ -187,8 +187,12 @@ impl BoundedReadSession {
             .canonicalize()
             .map_err(|error| invalid(format!("manifest root: {error}")))?;
         let mut entries = BTreeMap::new();
+        let mut paths = HashSet::new();
         for entry in manifest.entries {
             validate_entry(&root, &entry)?;
+            if !paths.insert(entry.path.clone()) {
+                return Err(invalid("duplicate artifact path"));
+            }
             if entries.insert(entry.artifact_id.clone(), entry).is_some() {
                 return Err(invalid("duplicate artifact id"));
             }
@@ -642,7 +646,12 @@ mod tests {
             "artifact_id": "artifact", "path": "artifact.txt", "sha256": sha256_hex(&vec![b'x'; 3_100]),
             "size": 3_100, "media_type": "text/plain"
         });
-        assert!(bad(json!([valid.clone(), valid])).is_err());
+        assert!(bad(json!([valid.clone(), valid.clone()])).is_err());
+        let same_path = json!({
+            "artifact_id": "second", "path": "artifact.txt", "sha256": sha256_hex(&vec![b'x'; 3_100]),
+            "size": 3_100, "media_type": "text/plain"
+        });
+        assert!(bad(json!([valid, same_path])).is_err());
 
         #[cfg(unix)]
         {
