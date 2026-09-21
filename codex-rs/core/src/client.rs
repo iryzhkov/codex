@@ -1281,6 +1281,27 @@ impl ModelClientSession {
         )
     }
 
+    fn ensure_controlled_response_session_source(&self) -> Result<()> {
+        let message = match &self.client.state.controlled_response_config {
+            ControlledResponseConfig::Disabled => return Ok(()),
+            ControlledResponseConfig::Invalid(message) => message.clone(),
+            ControlledResponseConfig::Enabled { .. }
+                if matches!(
+                    self.client.state.session_source,
+                    SessionSource::Internal(_) | SessionSource::SubAgent(_)
+                ) =>
+            {
+                "controlled response mode only permits a primary application session".to_string()
+            }
+            ControlledResponseConfig::Enabled { .. } => return Ok(()),
+        };
+        Err(self
+            .client
+            .state
+            .provider
+            .map_api_error(ApiError::Stream(message)))
+    }
+
     fn controlled_response_limits(&self) -> Result<Option<(usize, u64)>> {
         match &self.client.state.controlled_response_config {
             ControlledResponseConfig::Disabled => Ok(None),
@@ -2177,6 +2198,7 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
+        self.ensure_controlled_response_session_source()?;
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
             WireApi::Responses => {

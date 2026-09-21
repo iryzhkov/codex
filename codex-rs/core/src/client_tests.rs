@@ -327,6 +327,39 @@ fn controlled_response_fences_second_submission_across_sessions() {
     );
 }
 
+#[test]
+fn controlled_response_source_admission_preserves_disabled_and_primary_sessions() {
+    let disabled_internal = test_model_client(SessionSource::Internal(
+        InternalSessionSource::MemoryConsolidation,
+    ));
+    assert!(
+        disabled_internal
+            .new_session()
+            .ensure_controlled_response_session_source()
+            .is_ok()
+    );
+
+    for source in [
+        SessionSource::Cli,
+        SessionSource::Exec,
+        SessionSource::VSCode,
+    ] {
+        let mut client = test_model_client(source);
+        Arc::get_mut(&mut client.state)
+            .expect("test client state is uniquely owned")
+            .controlled_response_config = ControlledResponseConfig::Enabled {
+            max_input: 16_384,
+            max_output: 512,
+        };
+        assert!(
+            client
+                .new_session()
+                .ensure_controlled_response_session_source()
+                .is_ok()
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 #[serial_test::serial(controlled_response_env)]
@@ -1216,6 +1249,58 @@ async fn controlled_response_refuses_side_endpoints_without_network_requests() -
         .await;
     assert!(existing_call_result.is_err());
     assert!(client.ensure_realtime_allowed().is_err());
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn controlled_response_refuses_internal_and_subagent_turns_without_network_requests()
+-> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(/*requests*/ 0)
+        .mount(&server)
+        .await;
+
+    for source in [
+        SessionSource::Internal(InternalSessionSource::MemoryConsolidation),
+        SessionSource::Internal(InternalSessionSource::Guardian),
+        SessionSource::SubAgent(SubAgentSource::Review),
+    ] {
+        let mut client = test_model_client(source);
+        Arc::get_mut(&mut client.state)
+            .expect("test client state is uniquely owned")
+            .controlled_response_config = ControlledResponseConfig::Enabled {
+            max_input: 16_384,
+            max_output: 512,
+        };
+        set_test_provider(&mut client, format!("{}/v1", server.uri()), false);
+        let metadata = test_responses_metadata_for_client(
+            &client,
+            /*turn_id*/ None,
+            format!("{}:0", client.state.thread_id),
+            /*parent_thread_id*/ None,
+            TestCodexResponsesRequestKind::Turn,
+        );
+
+        let result = client
+            .new_session()
+            .stream(
+                &Prompt::default(),
+                &test_model_info(),
+                &test_session_telemetry(),
+                /*effort*/ None,
+                codex_protocol::config_types::ReasoningSummary::None,
+                /*service_tier*/ None,
+                &metadata,
+                &InferenceTraceContext::disabled(),
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
     server.verify().await;
     Ok(())
 }
