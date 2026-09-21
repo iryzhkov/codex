@@ -3689,6 +3689,39 @@ impl Session {
         let session_telemetry = settings.telemetry(&turn_context.session_telemetry);
         // Keep selections fixed for the turn while allowing their startup work to finish.
         let environments = turn_context.environments.refresh_readiness();
+        if self
+            .services
+            .model_client
+            .bounded_read_session()
+            .map_err(CodexErr::Fatal)?
+            .is_some()
+        {
+            let extension_data =
+                codex_extension_api::ExtensionData::new(turn_context.sub_id.clone());
+            let mcp = Arc::new(codex_mcp::McpBinding::empty(Arc::new(
+                self.runtime_mcp_config(&turn_context.config).await,
+            )));
+            let tool_router = turn::bounded_read_tools(
+                self,
+                turn_context.as_ref(),
+                &settings.model_info,
+                &environments,
+                &mcp,
+                &extension_data,
+            )?;
+            return Ok(Arc::new(StepContext {
+                settings,
+                token_budget,
+                session_telemetry,
+                turn: turn_context,
+                environments,
+                selected_capability_roots: Vec::new(),
+                executor_capability_discovery: None,
+                mcp,
+                tool_router,
+                loaded_agents_md: None,
+            }));
+        }
         self.services
             .agents_md_manager
             .refresh(&turn_context.config, &environments)

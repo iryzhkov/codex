@@ -257,6 +257,7 @@ struct ModelClientState {
     disable_websockets: AtomicBool,
     controlled_response_config: ControlledResponseConfig,
     controlled_response_submitted: AtomicBool,
+    bounded_read_session: std::result::Result<Option<Arc<crate::bounded_read::BoundedReadSession>>, String>,
     agent_identity_session_fallback: AgentIdentitySessionFallback,
     cached_websocket_session: StdMutex<WebsocketSession>,
 }
@@ -507,6 +508,16 @@ impl ModelClient {
         let auth_env_telemetry =
             collect_auth_env_telemetry(model_provider.info(), codex_api_key_env_enabled);
         let include_attestation = model_provider.supports_attestation();
+        let controlled_response_config = ControlledResponseConfig::from_env();
+        let mut bounded_read_session =
+            crate::bounded_read::BoundedReadSession::from_env().map_err(|error| error.to_string());
+        if !matches!(controlled_response_config, ControlledResponseConfig::Disabled)
+            && matches!(bounded_read_session, Ok(Some(_)))
+        {
+            bounded_read_session =
+                Err("one-shot controlled response and bounded read modes are mutually exclusive"
+                    .to_string());
+        }
         Self {
             state: Arc::new(ModelClientState {
                 thread_id,
@@ -523,8 +534,9 @@ impl ModelClient {
                 include_attestation,
                 attestation_provider,
                 disable_websockets: AtomicBool::new(false),
-                controlled_response_config: ControlledResponseConfig::from_env(),
+                controlled_response_config,
                 controlled_response_submitted: AtomicBool::new(false),
+                bounded_read_session,
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
             }),
@@ -981,6 +993,12 @@ impl ModelClient {
         }
     }
 
+    pub(crate) fn bounded_read_session(
+        &self,
+    ) -> std::result::Result<Option<Arc<crate::bounded_read::BoundedReadSession>>, String> {
+        self.state.bounded_read_session.clone()
+    }
+
     /// Returns whether the Responses-over-WebSocket transport is active for this session.
     ///
     /// WebSocket use is controlled by provider capability and session-scoped fallback state.
@@ -988,7 +1006,8 @@ impl ModelClient {
         if !matches!(
             self.state.controlled_response_config,
             ControlledResponseConfig::Disabled
-        ) || !self.state.provider.info().supports_websockets
+        ) || !matches!(self.state.bounded_read_session, Ok(None))
+            || !self.state.provider.info().supports_websockets
             || self.state.disable_websockets.load(Ordering::Relaxed)
         {
             return false;
@@ -1002,6 +1021,20 @@ impl ModelClient {
     }
 
     fn ensure_controlled_response_endpoint(&self, endpoint: &str) -> Result<()> {
+        match &self.state.bounded_read_session {
+            Ok(Some(_)) => {
+                return Err(self.state.provider.map_api_error(ApiError::Stream(format!(
+                    "bounded read mode does not permit requests to {endpoint}"
+                ))));
+            }
+            Err(message) => {
+                return Err(self
+                    .state
+                    .provider
+                    .map_api_error(ApiError::Stream(message.clone())));
+            }
+            Ok(None) => {}
+        }
         let message = match &self.state.controlled_response_config {
             ControlledResponseConfig::Disabled => return Ok(()),
             ControlledResponseConfig::Enabled { .. } => {
@@ -1324,6 +1357,58 @@ impl ModelClientSession {
         use_responses_lite: bool,
         request_kind: Option<CodexResponsesRequestKind>,
     ) -> Result<Option<usize>> {
+        if let Some(bounded) = self
+            .client
+            .bounded_read_session()
+            .map_err(|message| self.client.state.provider.map_api_error(ApiError::Stream(message)))?
+        {
+            if !matches!(self.client.state.session_source, SessionSource::Exec)
+                || model_info.used_fallback_model_metadata
+                || request.model != model_info.slug
+            {
+                return Err(self.client.state.provider.map_api_error(ApiError::Stream(
+                    "bounded read mode requires a primary exec session and verified selected model"
+                        .to_string(),
+                )));
+            }
+            let context_window = model_info
+                .resolved_context_window()
+                .and_then(|value| u64::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    self.client.state.provider.map_api_error(ApiError::Stream(
+                        "bounded read mode requires a positive model context window".to_string(),
+                    ))
+                })?;
+            if self.client.free_guardian_enabled
+                || !matches!(request_kind, Some(CodexResponsesRequestKind::Turn))
+                || use_responses_lite
+            {
+                return Err(self.client.state.provider.map_api_error(ApiError::Stream(
+                    "bounded read mode does not permit side inference or alternate request kinds"
+                        .to_string(),
+                )));
+            }
+            request.instructions.clear();
+            request.access_programs = None;
+            request.parallel_tool_calls = false;
+            request.max_output_tokens = Some(crate::bounded_read::MAX_OUTPUT_TOKENS);
+            let encoded = serde_json::to_vec(request).map_err(|error| {
+                self.client.state.provider.map_api_error(ApiError::Stream(format!(
+                    "failed to encode bounded read request: {error}"
+                )))
+            })?;
+            bounded
+                .admit_provider_request(encoded.len(), context_window)
+                .map_err(|error| {
+                    self.client.state.provider.map_api_error(ApiError::Stream(format!(
+                        "{}: {error}",
+                        error.code()
+                    )))
+                })?;
+            return Ok(Some(encoded.len()));
+        }
+
         let Some((max_input, max_output)) = self.controlled_response_limits()? else {
             return Ok(None);
         };

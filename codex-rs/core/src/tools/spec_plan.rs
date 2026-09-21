@@ -70,6 +70,7 @@ use codex_protocol::account::PlanType;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::PermissionProfile;
@@ -133,6 +134,26 @@ pub(crate) fn build_tool_router(
     step_store: &ExtensionData,
     tool_suggest_candidates: Option<&crate::tools::router::ToolSuggestCandidates>,
 ) -> CodexResult<ToolRouter> {
+    if let Some(bounded) = session
+        .services
+        .model_client
+        .bounded_read_session()
+        .map_err(CodexErr::Fatal)?
+    {
+        let handler = crate::bounded_read::BoundedReadHandler::new(bounded);
+        let specs = vec![handler.spec()];
+        let mut registry = ToolRegistry::default();
+        registry.add(handler);
+        return Ok(ToolRouter::from_parts(
+            registry,
+            specs,
+            ToolMode::Direct,
+            BTreeMap::new(),
+            None,
+            &[],
+        ));
+    }
+
     let default_agent_type_description =
         crate::agent::role::spawn_tool_spec::build(&std::collections::BTreeMap::new());
     let wait_for_environment_tool_config = session

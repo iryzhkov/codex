@@ -1,4 +1,15 @@
+use crate::function_tool::FunctionCallError;
+use crate::tools::context::FunctionToolOutput;
+use crate::tools::context::ToolInvocation;
+use crate::tools::context::ToolPayload;
+use crate::tools::context::boxed_tool_output;
+use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::ToolExecutor;
 use base64::Engine;
+use codex_tools::JsonSchema;
+use codex_tools::ResponsesApiTool;
+use codex_tools::ToolName;
+use codex_tools::ToolSpec;
 use rand::RngCore;
 use serde::Deserialize;
 use serde::Serialize;
@@ -92,6 +103,7 @@ pub(crate) struct ReadPage {
 }
 
 #[derive(Default)]
+#[derive(Debug)]
 struct Admission {
     provider_requests: u8,
     provider_bytes: usize,
@@ -102,11 +114,13 @@ struct Admission {
 }
 
 #[derive(Clone)]
+#[derive(Debug)]
 struct Cursor {
     artifact_id: String,
     offset: u64,
 }
 
+#[derive(Debug)]
 pub(crate) struct BoundedReadSession {
     root: PathBuf,
     manifest_sha256: String,
@@ -351,6 +365,89 @@ impl BoundedReadSession {
         hex(&hash.finalize())
     }
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadPageArgs {
+    artifact_id: String,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+pub(crate) struct BoundedReadHandler {
+    session: std::sync::Arc<BoundedReadSession>,
+}
+
+impl BoundedReadHandler {
+    pub(crate) fn new(session: std::sync::Arc<BoundedReadSession>) -> Self {
+        Self { session }
+    }
+}
+
+impl ToolExecutor<ToolInvocation> for BoundedReadHandler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain("read_custodied_page")
+    }
+
+    fn spec(&self) -> ToolSpec {
+        let properties = BTreeMap::from([
+            (
+                "artifact_id".to_string(),
+                JsonSchema::string(Some(
+                    "Custodied artifact identifier from the request package.".to_string(),
+                )),
+            ),
+            (
+                "cursor".to_string(),
+                JsonSchema::string(Some(
+                    "Opaque cursor returned by the preceding page.".to_string(),
+                )),
+            ),
+        ]);
+        ToolSpec::Function(ResponsesApiTool {
+            name: "read_custodied_page".to_string(),
+            description: "Read one bounded page from an allowlisted custodied request artifact."
+                .to_string(),
+            strict: true,
+            defer_loading: None,
+            parameters: JsonSchema::object(
+                properties,
+                Some(vec!["artifact_id".to_string()]),
+                Some(false.into()),
+            ),
+            output_schema: None,
+        })
+    }
+
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
+        Box::pin(async move {
+            let ToolPayload::Function { arguments } = invocation.payload else {
+                return Err(FunctionCallError::Fatal(
+                    "bounded read received a non-function payload".to_string(),
+                ));
+            };
+            let args: ReadPageArgs = serde_json::from_str(&arguments).map_err(|error| {
+                FunctionCallError::Fatal(format!("invalid-custody: invalid bounded read arguments: {error}"))
+            })?;
+            let page = self
+                .session
+                .read_page(&args.artifact_id, args.cursor.as_deref())
+                .map_err(|error| FunctionCallError::Fatal(format!("{}: {error}", error.code())))?;
+            let output = serde_json::to_string(&page).map_err(|error| {
+                FunctionCallError::Fatal(format!("invalid-custody: failed to serialize page: {error}"))
+            })?;
+            Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                output,
+                Some(true),
+            )))
+        })
+    }
+}
+
+impl CoreToolRuntime for BoundedReadHandler {}
 
 fn env_text(value: &Option<std::ffi::OsString>, name: &str) -> Result<String, BoundedReadError> {
     let text = value

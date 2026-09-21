@@ -146,6 +146,57 @@ pub(crate) struct McpStartupRequirements {
     required_plugins: HashSet<String>,
 }
 
+async fn run_bounded_read_turn(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    input: Vec<TurnInput>,
+    cancellation_token: CancellationToken,
+) -> CodexResult<Option<String>> {
+    let step_context = sess
+        .capture_step_context_with_required_mcp_servers(
+            Arc::clone(&turn_context),
+            &cancellation_token,
+            &[],
+            &HashSet::new(),
+        )
+        .await?;
+    for item in input {
+        record_pending_input(
+            &sess,
+            &turn_context,
+            &step_context.settings.model_info,
+            item,
+            Vec::new(),
+            PersistContext::TurnStart,
+        )
+        .await;
+    }
+    let mut client_session = sess.services.model_client.new_session();
+    loop {
+        let input = sess
+            .clone_history()
+            .await
+            .for_prompt(&step_context.settings.model_info.input_modalities);
+        let responses_metadata = sess
+            .responses_metadata(turn_context.as_ref(), CodexResponsesRequestKind::Turn)
+            .await;
+        let (output, _) = run_sampling_request(
+            Arc::clone(&sess),
+            Arc::clone(&step_context),
+            Arc::clone(&turn_context.extension_data),
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+            &mut client_session,
+            &responses_metadata,
+            input,
+            cancellation_token.child_token(),
+        )
+        .await?;
+        if !output.needs_follow_up {
+            return Ok(output.last_agent_message);
+        }
+    }
+}
+
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
 ///
@@ -168,6 +219,15 @@ pub(crate) async fn run_turn(
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<Option<String>> {
+    if sess
+        .services
+        .model_client
+        .bounded_read_session()
+        .map_err(CodexErr::Fatal)?
+        .is_some()
+    {
+        return run_bounded_read_turn(sess, turn_context, input, cancellation_token).await;
+    }
     if crate::guardian::is_basic_session_source(&turn_context.session_source) {
         crate::guardian::check_pending_guardian_input(&sess, &turn_context).await?;
     }
@@ -1699,6 +1759,27 @@ pub(crate) async fn prepare_tool_recommendations(
         apps_enabled = turn_context.apps_enabled()
     )
 )]
+pub(crate) fn bounded_read_tools(
+    sess: &Session,
+    turn_context: &TurnContext,
+    model_info: &codex_protocol::openai_models::ModelInfo,
+    environments: &TurnEnvironmentSnapshot,
+    mcp: &Arc<codex_mcp::McpBinding>,
+    step_store: &ExtensionData,
+) -> CodexResult<Arc<ToolRouter>> {
+    Ok(Arc::new(build_tool_router(
+        sess,
+        turn_context,
+        model_info,
+        /*model_messages*/ None,
+        environments,
+        mcp,
+        /*apps_enabled*/ false,
+        step_store,
+        /*tool_suggest_candidates*/ None,
+    )?))
+}
+
 pub(crate) async fn built_tools(
     sess: &Session,
     turn_context: &TurnContext,
@@ -2360,6 +2441,23 @@ async fn drain_in_flight(
     while let Some(res) = in_flight.next().await {
         match res {
             Ok(envelope) => {
+                if let Some(bounded) = sess
+                    .services
+                    .model_client
+                    .bounded_read_session()
+                    .map_err(CodexErr::Fatal)?
+                {
+                    let serialized_len = serde_json::to_vec(&envelope.item)
+                        .map_err(|error| {
+                            CodexErr::Fatal(format!(
+                                "invalid-custody: failed to serialize bounded tool result: {error}"
+                            ))
+                        })?
+                        .len();
+                    bounded.admit_tool_result(serialized_len).map_err(|error| {
+                        CodexErr::Fatal(format!("{}: {error}", error.code()))
+                    })?;
+                }
                 mark_thread_memory_mode_polluted_if_external_context(
                     sess.as_ref(),
                     turn_context.as_ref(),
