@@ -1415,12 +1415,14 @@ impl ModelClientSession {
                         "failed to encode bounded read request: {error}"
                     )))
             })?;
-            bounded.validate_provider_request(&encoded).map_err(|error| {
-                self.client
-                    .state
-                    .provider
-                    .map_api_error(ApiError::Stream(format!("{}: {error}", error.code())))
-            })?;
+            bounded
+                .validate_provider_request(&encoded)
+                .map_err(|error| {
+                    self.client
+                        .state
+                        .provider
+                        .map_api_error(ApiError::Stream(format!("{}: {error}", error.code())))
+                })?;
             bounded
                 .admit_provider_request(encoded.len(), context_window)
                 .map_err(|error| {

@@ -353,10 +353,7 @@ impl BoundedReadSession {
         Ok(())
     }
 
-    pub(crate) fn validate_provider_request(
-        &self,
-        encoded: &[u8],
-    ) -> Result<(), BoundedReadError> {
+    pub(crate) fn validate_provider_request(&self, encoded: &[u8]) -> Result<(), BoundedReadError> {
         let request: serde_json::Value = serde_json::from_slice(encoded)
             .map_err(|error| invalid(format!("provider request JSON: {error}")))?;
         if request.get("parallel_tool_calls") != Some(&serde_json::Value::Bool(false)) {
@@ -382,8 +379,7 @@ impl BoundedReadSession {
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| invalid("bounded read tool required fields are missing"))?;
         let exact_tool = tool.get("type").and_then(serde_json::Value::as_str) == Some("function")
-            && tool.get("name").and_then(serde_json::Value::as_str)
-                == Some("read_custodied_page")
+            && tool.get("name").and_then(serde_json::Value::as_str) == Some("read_custodied_page")
             && tool.get("strict") == Some(&serde_json::Value::Bool(true))
             && parameters.get("type").and_then(serde_json::Value::as_str) == Some("object")
             && parameters.get("additionalProperties") == Some(&serde_json::Value::Bool(false))

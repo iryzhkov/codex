@@ -1,9 +1,9 @@
 #![cfg(target_os = "linux")]
 
 use anyhow::Result;
-use codex_protocol::protocol::SessionSource;
 use codex_core::TurnInputRequest;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -36,6 +36,17 @@ const ENV_KEYS: [&str; 5] = [
 struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
 
 impl EnvGuard {
+    fn unset() -> Self {
+        let old = ENV_KEYS
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        for key in ENV_KEYS {
+            unsafe { std::env::remove_var(key) };
+        }
+        Self(old)
+    }
+
     fn set_one(key: &'static str, value: &OsStr) -> Self {
         let old = vec![(key, std::env::var_os(key))];
         unsafe { std::env::set_var(key, value) };
@@ -111,6 +122,46 @@ fn tool_names(body: &Value) -> Vec<&str> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial(bounded_read_env)]
+async fn normal_mode_allows_two_user_turn_posts_when_custody_env_is_absent() -> Result<()> {
+    let _env = EnvGuard::unset();
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-normal-1"),
+                ev_assistant_message("msg-normal-1", "first"),
+                ev_completed("resp-normal-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-normal-2"),
+                ev_assistant_message("msg-normal-2", "second"),
+                ev_completed("resp-normal-2"),
+            ]),
+        ],
+    )
+    .await;
+    let fixture = test_codex().with_model("gpt-5.4").build(&server).await?;
+    for text in ["first", "second"] {
+        fixture
+            .codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: text.into(),
+                text_elements: Vec::new(),
+            }]))
+            .await?;
+        let terminal = wait_for_event(&fixture.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_) | EventMsg::Error(_))
+        })
+        .await;
+        assert!(matches!(terminal, EventMsg::TurnComplete(_)));
+    }
+    assert_eq!(responses.requests().len(), 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(bounded_read_env)]
 async fn incomplete_custody_fails_during_session_spawn() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let manifest_path = dir.path().join("manifest.json");
@@ -122,7 +173,11 @@ async fn incomplete_custody_fails_during_session_spawn() -> Result<()> {
         Ok(_) => anyhow::bail!("incomplete custody unexpectedly started a session"),
         Err(error) => error,
     };
-    assert!(error.to_string().contains("bounded read environment is incomplete"));
+    assert!(
+        error
+            .to_string()
+            .contains("bounded read environment is incomplete")
+    );
     Ok(())
 }
 
@@ -293,7 +348,7 @@ async fn second_user_turn_is_rejected_before_another_post() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 #[serial(bounded_read_env)]
 async fn stalled_stream_is_cut_off_by_session_deadline() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -310,6 +365,7 @@ async fn stalled_stream_is_cut_off_by_session_deadline() -> Result<()> {
     )
     .await;
     let fixture = test_codex().with_model("gpt-5.4").build(&server).await?;
+    tokio::time::pause();
     fixture
         .codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -317,10 +373,22 @@ async fn stalled_stream_is_cut_off_by_session_deadline() -> Result<()> {
             text_elements: Vec::new(),
         }]))
         .await?;
+    for _ in 0..1_000 {
+        if responses.requests().len() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        responses.requests().len(),
+        1,
+        "request never reached server"
+    );
+    tokio::time::advance(Duration::from_secs(15 * 60 + 1)).await;
+    tokio::time::resume();
     for _ in 0..10 {
         tokio::task::yield_now().await;
     }
-    tokio::time::advance(Duration::from_secs(15 * 60 + 1)).await;
     let terminal = wait_for_event(&fixture.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_) | EventMsg::Error(_))
     })
@@ -335,8 +403,9 @@ async fn stalled_stream_is_cut_off_by_session_deadline() -> Result<()> {
 #[serial(bounded_read_env)]
 async fn oversized_serialized_tool_output_stops_before_second_post() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let artifact_id = "a".repeat(128);
-    let _env = custody_env(&dir, &artifact_id, &[b'x'; 1024]);
+    let artifact_id = "artifact";
+    let call_id = "c".repeat(1_024);
+    let _env = custody_env(&dir, artifact_id, &[b'x'; 1024]);
 
     let server = start_mock_server().await;
     let responses = mount_sse_sequence(
@@ -344,7 +413,7 @@ async fn oversized_serialized_tool_output_stops_before_second_post() -> Result<(
         vec![sse(vec![
             ev_response_created("resp-1"),
             ev_function_call(
-                "read-1",
+                &call_id,
                 "read_custodied_page",
                 &json!({"artifact_id": artifact_id, "cursor": null}).to_string(),
             ),
@@ -369,7 +438,14 @@ async fn oversized_serialized_tool_output_stops_before_second_post() -> Result<(
         matches!(terminal, EventMsg::Error(_)),
         "unexpected terminal: {terminal:?}"
     );
-    assert!(format!("{terminal:?}").contains("budget-exhausted"));
-    assert_eq!(responses.requests().len(), 1);
+    assert_eq!(
+        responses.requests().len(),
+        1,
+        "unexpected request count for terminal: {terminal:?}"
+    );
+    assert!(
+        format!("{terminal:?}").contains("budget-exhausted"),
+        "unexpected terminal: {terminal:?}"
+    );
     Ok(())
 }

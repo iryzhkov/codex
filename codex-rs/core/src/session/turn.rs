@@ -2617,8 +2617,8 @@ async fn try_run_sampling_request(
     let plan_mode = !bounded_read && turn_context.mode() == ModeKind::Plan;
     let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
-    let defer_streamed_turn_items_for_contributors = !bounded_read
-        && !sess.services.extensions.turn_item_contributors().is_empty();
+    let defer_streamed_turn_items_for_contributors =
+        !bounded_read && !sess.services.extensions.turn_item_contributors().is_empty();
     let mut active_item_is_streaming_to_client = false;
     let receiving_span = trace_span!("receiving_stream");
     let outcome: CodexResult<SamplingRequestResult> = loop {

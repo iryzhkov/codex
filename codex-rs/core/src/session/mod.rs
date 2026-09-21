@@ -574,7 +574,10 @@ impl Session {
             windows_sandbox_proxy_settings_mode,
         } = args;
         if bounded_read_enabled {
-            if !matches!(conversation_history, InitialHistory::New | InitialHistory::Cleared) {
+            if !matches!(
+                conversation_history,
+                InitialHistory::New | InitialHistory::Cleared
+            ) {
                 return Err(CodexErr::InvalidRequest(
                     "bounded read requires a fresh conversation".to_string(),
                 ));
