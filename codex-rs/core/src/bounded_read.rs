@@ -20,9 +20,6 @@ use std::collections::HashSet;
 use std::env;
 use std::fs::File;
 use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
-use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -40,6 +37,8 @@ pub(crate) const PROVIDER_FRAMING_RESERVE: u64 = 4_096;
 pub(crate) const DEADLINE: Duration = Duration::from_secs(15 * 60);
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_ARTIFACTS: usize = 64;
+const MAX_ARTIFACT_BYTES_TOTAL: u64 = 32 * 1024 * 1024;
 const MAX_PAGE_CONTENT_BYTES: usize = 1_024;
 
 const ENV_MANIFEST: &str = "CODEX_BOUNDED_READ_MANIFEST";
@@ -89,6 +88,8 @@ struct ManifestEntry {
     sha256: String,
     size: u64,
     media_type: String,
+    #[serde(skip)]
+    content: Vec<u8>,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,7 +123,6 @@ struct Cursor {
 
 #[derive(Debug)]
 pub(crate) struct BoundedReadSession {
-    root: PathBuf,
     manifest_sha256: String,
     request_id: String,
     project_id: String,
@@ -176,13 +176,10 @@ impl BoundedReadSession {
         started_at: Instant,
     ) -> Result<Self, BoundedReadError> {
         validate_digest(expected_digest)?;
-        reject_symlink_components(manifest_path)?;
-        let metadata = std::fs::symlink_metadata(manifest_path)
-            .map_err(|error| invalid(format!("manifest metadata: {error}")))?;
-        if !metadata.file_type().is_file() || metadata.len() > MAX_MANIFEST_BYTES {
-            return Err(invalid("manifest is not a bounded regular file"));
+        if !manifest_path.is_absolute() {
+            return Err(invalid("manifest path is not absolute"));
         }
-        let bytes = read_bounded(manifest_path, MAX_MANIFEST_BYTES)?;
+        let bytes = read_bounded_absolute(manifest_path, MAX_MANIFEST_BYTES)?;
         if sha256_hex(&bytes) != expected_digest {
             return Err(invalid("manifest digest mismatch"));
         }
@@ -197,24 +194,34 @@ impl BoundedReadSession {
         }
         let root = manifest_path
             .parent()
-            .ok_or_else(|| invalid("manifest has no parent"))?
-            .canonicalize()
-            .map_err(|error| invalid(format!("manifest root: {error}")))?;
-        let mut entries = BTreeMap::new();
+            .ok_or_else(|| invalid("manifest has no parent"))?;
+        if manifest.entries.len() > MAX_ARTIFACTS {
+            return Err(invalid("too many artifacts"));
+        }
+        let mut declared_total = 0_u64;
         let mut paths = HashSet::new();
-        for entry in manifest.entries {
-            validate_entry(&root, &entry)?;
-            if !paths.insert(entry.path.clone()) {
-                return Err(invalid("duplicate artifact path"));
+        let mut ids = HashSet::new();
+        for entry in &manifest.entries {
+            validate_entry_shape(entry)?;
+            declared_total = declared_total
+                .checked_add(entry.size)
+                .ok_or_else(|| invalid("aggregate artifact size overflow"))?;
+            if declared_total > MAX_ARTIFACT_BYTES_TOTAL {
+                return Err(invalid("aggregate artifact size exceeds limit"));
             }
-            if entries.insert(entry.artifact_id.clone(), entry).is_some() {
-                return Err(invalid("duplicate artifact id"));
+            if !paths.insert(entry.path.clone()) || !ids.insert(entry.artifact_id.clone()) {
+                return Err(invalid("duplicate artifact id or path"));
             }
+        }
+        let root_dir = open_directory_absolute(root)?;
+        let mut entries = BTreeMap::new();
+        for mut entry in manifest.entries {
+            entry.content = read_verified_artifact(&root_dir, &entry)?;
+            entries.insert(entry.artifact_id.clone(), entry);
         }
         let mut nonce = [0_u8; 32];
         rand::rng().fill_bytes(&mut nonce);
         Ok(Self {
-            root,
             manifest_sha256: expected_digest.to_owned(),
             request_id,
             project_id,
@@ -257,15 +264,15 @@ impl BoundedReadSession {
         if offset > entry.size {
             return Err(invalid("cursor offset exceeds artifact"));
         }
-        let mut file = verified_artifact_file(&self.root, entry)?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|error| invalid(format!("artifact seek: {error}")))?;
         let remaining = entry.size - offset;
         let amount = usize::try_from(remaining.min(MAX_PAGE_CONTENT_BYTES as u64))
             .map_err(|_| invalid("page size conversion"))?;
-        let mut content = vec![0_u8; amount];
-        file.read_exact(&mut content)
-            .map_err(|error| invalid(format!("artifact page read: {error}")))?;
+        let start = usize::try_from(offset).map_err(|_| invalid("page offset conversion"))?;
+        let end = start.checked_add(amount).ok_or_else(|| invalid("page range overflow"))?;
+        let content = entry
+            .content
+            .get(start..end)
+            .ok_or_else(|| invalid("page range exceeds verified artifact"))?;
         let end_offset = offset
             .checked_add(amount as u64)
             .ok_or(BoundedReadError::BudgetExhausted)?;
@@ -461,113 +468,82 @@ fn env_text(value: &Option<std::ffi::OsString>, name: &str) -> Result<String, Bo
     Ok(text.to_owned())
 }
 
-fn validate_entry(root: &Path, entry: &ManifestEntry) -> Result<(), BoundedReadError> {
-    if entry.artifact_id.is_empty() || entry.artifact_id.len() > 128 {
+fn validate_entry_shape(entry: &ManifestEntry) -> Result<(), BoundedReadError> {
+    if entry.artifact_id.is_empty()
+        || entry.artifact_id.len() > 128
+        || !entry
+            .artifact_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
         return Err(invalid("invalid artifact id"));
     }
     validate_digest(&entry.sha256)?;
     if entry.size > MAX_ARTIFACT_BYTES || !entry.media_type.starts_with("text/") {
         return Err(invalid("unsupported artifact size or media type"));
     }
-    verified_artifact_file(root, entry)?;
+    validate_relative_path(&entry.path)
+}
+
+fn validate_relative_path(value: &str) -> Result<(), BoundedReadError> {
+    if value.is_empty()
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.as_bytes().contains(&b'\\')
+        || value
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return Err(invalid("artifact path is not canonical relative"));
+    }
     Ok(())
 }
 
-fn verified_artifact_file(
-    root: &Path,
+fn read_verified_artifact(
+    root: &File,
     entry: &ManifestEntry,
-) -> Result<File, BoundedReadError> {
-    let path = checked_artifact_path(root, entry)?;
-    let mut file = open_nofollow(&path)?;
+) -> Result<Vec<u8>, BoundedReadError> {
+    let file = open_relative(root, Path::new(&entry.path), false)?;
     let metadata = file
         .metadata()
         .map_err(|error| invalid(format!("artifact metadata: {error}")))?;
     if !metadata.is_file() || metadata.len() != entry.size {
         return Err(invalid("artifact is not a declared regular file"));
     }
-    let mut hash = Sha256::new();
-    let mut total = 0_u64;
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let count = file
-            .read(&mut buffer)
-            .map_err(|error| invalid(format!("artifact read: {error}")))?;
-        if count == 0 {
-            break;
-        }
-        total = total
-            .checked_add(count as u64)
-            .ok_or_else(|| invalid("artifact size overflow"))?;
-        if total > entry.size {
-            return Err(invalid("artifact exceeds declared size"));
-        }
-        hash.update(&buffer[..count]);
-    }
-    if total != entry.size || hex(&hash.finalize()) != entry.sha256 {
+    let bytes = read_bounded_file(file, entry.size)?;
+    if bytes.len() as u64 != entry.size || sha256_hex(&bytes) != entry.sha256 {
         return Err(invalid("artifact size or digest mismatch"));
     }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| invalid(format!("artifact rewind: {error}")))?;
-    Ok(file)
+    Ok(bytes)
 }
 
-fn checked_artifact_path(root: &Path, entry: &ManifestEntry) -> Result<PathBuf, BoundedReadError> {
-    let relative = Path::new(&entry.path);
-    if relative.as_os_str().is_empty()
-        || relative.is_absolute()
-        || relative
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
-    {
-        return Err(invalid("artifact path is not canonical relative"));
+fn read_bounded_absolute(path: &Path, limit: u64) -> Result<Vec<u8>, BoundedReadError> {
+    let root = open_os_root()?;
+    let relative = path
+        .strip_prefix(Path::new("/"))
+        .map_err(|_| invalid("manifest path is not absolute"))?;
+    let file = open_relative(&root, relative, false)?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| invalid(format!("bounded file metadata: {error}")))?;
+    if !metadata.is_file() || metadata.len() > limit {
+        return Err(invalid("bounded file is not a regular file within limit"));
     }
-    let path = root.join(relative);
-    reject_symlink_components(&path)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid("artifact has no parent"))?
-        .canonicalize()
-        .map_err(|error| invalid(format!("artifact parent: {error}")))?;
-    if !parent.starts_with(root) {
-        return Err(invalid("artifact escapes manifest root"));
-    }
-    Ok(path)
+    read_bounded_file(file, limit)
 }
 
-fn reject_symlink_components(path: &Path) -> Result<(), BoundedReadError> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component);
-        match std::fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(invalid("symlink component"));
-            }
-            Ok(_) => {}
-            Err(error) => return Err(invalid(format!("path metadata: {error}"))),
-        }
-    }
-    Ok(())
+fn open_directory_absolute(path: &Path) -> Result<File, BoundedReadError> {
+    let root = open_os_root()?;
+    let relative = path
+        .strip_prefix(Path::new("/"))
+        .map_err(|_| invalid("directory path is not absolute"))?;
+    open_relative(&root, relative, true)
 }
 
-#[cfg(unix)]
-fn open_nofollow(path: &Path) -> Result<File, BoundedReadError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|error| invalid(format!("open: {error}")))
-}
-
-#[cfg(not(unix))]
-fn open_nofollow(path: &Path) -> Result<File, BoundedReadError> {
-    reject_symlink_components(path)?;
-    File::open(path).map_err(|error| invalid(format!("open: {error}")))
-}
-
-fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, BoundedReadError> {
-    let file = open_nofollow(path)?;
-    let mut bytes = Vec::new();
+fn read_bounded_file(file: File, limit: u64) -> Result<Vec<u8>, BoundedReadError> {
+    let capacity = usize::try_from(limit.min(64 * 1024))
+        .map_err(|_| invalid("bounded allocation conversion"))?;
+    let mut bytes = Vec::with_capacity(capacity);
     file.take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| invalid(format!("bounded read: {error}")))?;
@@ -575,6 +551,103 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, BoundedReadError> {
         return Err(invalid("bounded file exceeds limit"));
     }
     Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn open_os_root() -> Result<File, BoundedReadError> {
+    use std::os::fd::FromRawFd;
+    let path = std::ffi::CString::new("/").expect("static root path");
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(invalid(format!("open custody root: {}", std::io::Error::last_os_error())));
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn open_relative(root: &File, path: &Path, directory: bool) -> Result<File, BoundedReadError> {
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    if path.as_os_str().is_empty() {
+        return root
+            .try_clone()
+            .map_err(|error| invalid(format!("clone custody root: {error}")));
+    }
+
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    const RESOLVE_BENEATH: u64 = 0x08;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| invalid("custody path contains NUL"))?;
+    let mut flags = (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+    if directory {
+        flags |= libc::O_DIRECTORY as u64;
+    }
+    let how = OpenHow {
+        flags,
+        mode: 0,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+    };
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            path.as_ptr(),
+            &how,
+            std::mem::size_of::<OpenHow>(),
+        )
+    } as libc::c_int;
+    if fd < 0 {
+        return Err(invalid(format!("rooted custody open: {}", std::io::Error::last_os_error())));
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_os_root() -> Result<File, BoundedReadError> {
+    File::open("/").map_err(|error| invalid(format!("open custody root: {error}")))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_relative(root: &File, path: &Path, directory: bool) -> Result<File, BoundedReadError> {
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let mut current = root
+        .try_clone()
+        .map_err(|error| invalid(format!("clone custody root: {error}")))?;
+    let components: Vec<_> = path.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(invalid("non-canonical custody path"));
+        };
+        let name = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| invalid("custody path contains NUL"))?;
+        let last = index + 1 == components.len();
+        let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        if !last || directory {
+            flags |= libc::O_DIRECTORY;
+        }
+        let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(invalid(format!("rooted custody open: {}", std::io::Error::last_os_error())));
+        }
+        current = unsafe { File::from_raw_fd(fd) };
+    }
+    Ok(current)
 }
 
 fn validate_digest(value: &str) -> Result<(), BoundedReadError> {
@@ -749,6 +822,13 @@ mod tests {
             "size": 3_100, "media_type": "text/plain"
         });
         assert!(bad(json!([valid, same_path])).is_err());
+        for (id, path) in [("bad id", "artifact.txt"), ("safe", "dir//artifact.txt"), ("safe", "dir/./artifact.txt")] {
+            let entry = json!({
+                "artifact_id": id, "path": path, "sha256": "0".repeat(64),
+                "size": 0, "media_type": "text/plain"
+            });
+            assert!(bad(json!([entry])).is_err());
+        }
 
         #[cfg(unix)]
         {
@@ -760,6 +840,64 @@ mod tests {
             assert!(bad(linked).is_err());
         }
         assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn verified_artifact_is_immutable_for_the_session() {
+        let (dir, session) = fixture();
+        std::fs::write(dir.path().join("artifact.txt"), vec![b'y'; 3_100]).unwrap();
+        let page = session.read_page("artifact", None).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(page.content_base64)
+            .unwrap();
+        assert_eq!(decoded, vec![b'x'; MAX_PAGE_CONTENT_BYTES]);
+    }
+
+    #[test]
+    fn manifest_limits_are_checked_before_artifact_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        let load = |entries: Vec<serde_json::Value>| {
+            let bytes = serde_json::to_vec(&json!({
+                "schema": "bounded-read-v1", "request_id": "request",
+                "project_id": "project", "revision": "revision", "entries": entries
+            })).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            BoundedReadSession::load(
+                &path, &sha256_hex(&bytes), "request".into(), "project".into(),
+                "revision".into(), Instant::now(),
+            )
+        };
+        let entry = |index: usize, size: u64| json!({
+            "artifact_id": format!("a{index}"), "path": format!("missing{index}"),
+            "sha256": "0".repeat(64), "size": size, "media_type": "text/plain"
+        });
+        assert!(load((0..=MAX_ARTIFACTS).map(|i| entry(i, 0)).collect()).is_err());
+        assert!(load((0..5).map(|i| entry(i, MAX_ARTIFACT_BYTES)).collect()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rooted_open_rejects_symlinked_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let content = b"outside";
+        std::fs::write(outside.path().join("artifact.txt"), content).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("linked")).unwrap();
+        let manifest = json!({
+            "schema": "bounded-read-v1", "request_id": "request",
+            "project_id": "project", "revision": "revision", "entries": [{
+                "artifact_id": "artifact", "path": "linked/artifact.txt",
+                "sha256": sha256_hex(content), "size": content.len(), "media_type": "text/plain"
+            }]
+        });
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(BoundedReadSession::load(
+            &path, &sha256_hex(&bytes), "request".into(), "project".into(),
+            "revision".into(), Instant::now(),
+        ).is_err());
     }
 
     #[test]
