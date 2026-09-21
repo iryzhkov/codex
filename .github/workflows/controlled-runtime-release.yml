@@ -23,6 +23,11 @@ jobs:
     name: Validate source and test release inputs
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_BUILD_JOBS: "2"
     outputs:
       version: ${{ steps.source.outputs.version }}
       commit: ${{ steps.source.outputs.commit }}
@@ -32,7 +37,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Validate immutable release identity
+      - name: Validate release identity
         id: source
         shell: bash
         run: |
@@ -63,6 +68,10 @@ jobs:
             echo "tree=$(git rev-parse 'HEAD^{tree}')"
           } >> "$GITHUB_OUTPUT"
       - uses: ./.github/actions/setup-ci
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532
+        with:
+          tool: nextest
+          version: 0.9.103
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -89,13 +98,17 @@ jobs:
             build-essential pkg-config libcap-dev libasound2-dev bubblewrap \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-tools
           gst-inspect-1.0 rtpjitterbuffer >/dev/null
+      - name: Build integration executables
+        working-directory: codex-rs
+        run: cargo build --locked -p codex-rmcp-client --bin test_stdio_server -p codex-code-mode-host --bin codex-code-mode-host -p codex-bwrap --bin bwrap -p codex-cli --bin codex
       - name: Run full workspace qualification
         working-directory: codex-rs
         env:
           RUST_MIN_STACK: "8388608"
         run: |
           set -euo pipefail
-          just test
+          just test --locked --features codex-v8-poc/sandbox --test-threads 4
+          git diff --exit-code
 
   build:
     name: Build ${{ matrix.target }}
@@ -301,7 +314,7 @@ jobs:
           retention-days: 7
 
   publish:
-    name: Publish immutable prerelease
+    name: Publish pinned prerelease
     needs: [quality-gate, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -367,9 +380,15 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --notes "$notes"
           cleanup_draft() {
-            gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes || true
+            # A publish request can succeed remotely even if its response is lost.
+            # Never delete a release that may already have become public.
+            if [[ "$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" == true ]]; then
+              gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes || true
+            fi
           }
           trap cleanup_draft ERR
           gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY"
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          [[ "$(git rev-list -n1 "$GITHUB_REF_NAME")" == "${{ needs.quality-gate.outputs.commit }}" ]]
           gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
           trap - ERR
