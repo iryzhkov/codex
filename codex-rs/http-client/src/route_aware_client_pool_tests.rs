@@ -46,9 +46,12 @@ async fn request_failures_classify_real_untrusted_certificate_handshakes() {
             .expect("TLS server connection should be created");
         let _ = connection.complete_io(&mut stream);
     });
-    let pool = RouteAwareClientPool::new_with_native_tls_for_test(
+    let pool = RouteAwareClientPool::with_builder(
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         ClientRouteClass::Api,
+        HttpClientBuilder::new()
+            .without_request_logging()
+            .with_native_tls(),
     );
 
     let request = pool
