@@ -614,6 +614,7 @@ impl RealtimeConversationManager {
             sdp,
             existing_call_id,
         } = start;
+        model_client.ensure_realtime_allowed()?;
         let event_parser = session_config.event_parser;
         let session_kind = match event_parser {
             RealtimeEventParser::V1 | RealtimeEventParser::FramelessBidi => RealtimeSessionKind::V1,

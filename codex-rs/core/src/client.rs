@@ -644,6 +644,7 @@ impl ModelClient {
         mut extra_headers: ApiHeaderMap,
         api_provider_override: Option<ApiProvider>,
     ) -> Result<RealtimeWebrtcCallStart> {
+        self.ensure_controlled_response_endpoint(REALTIME_CALLS_ENDPOINT)?;
         // Create the media call over HTTP first, then retain matching auth so realtime can attach
         // the server-side control WebSocket to the call id from that HTTP response.
         let client_setup = self.current_client_setup().await?;
@@ -671,6 +672,7 @@ impl ModelClient {
         &self,
         mut extra_headers: ApiHeaderMap,
     ) -> Result<ApiHeaderMap> {
+        self.ensure_controlled_response_endpoint("realtime sideband")?;
         let client_setup = self.current_client_setup().await?;
         if let Some(header_value) = self.generate_attestation_header_for().await {
             extra_headers.insert(X_OAI_ATTESTATION_HEADER, header_value);
@@ -698,6 +700,7 @@ impl ModelClient {
             return Ok(Vec::new());
         }
 
+        self.ensure_controlled_response_endpoint(MEMORIES_SUMMARIZE_ENDPOINT)?;
         let client_setup = self.current_client_setup().await?;
         let transport =
             self.build_api_transport(&client_setup.api_provider, MEMORIES_SUMMARIZE_ENDPOINT)?;
@@ -982,16 +985,31 @@ impl ModelClient {
     ///
     /// WebSocket use is controlled by provider capability and session-scoped fallback state.
     pub fn responses_websocket_enabled(&self) -> bool {
-        if std::env::var_os("T3_CODEX_CONTROLLED_RESPONSE_MAX_INPUT_BYTES").is_some() {
-            return false;
-        }
-        if !self.state.provider.info().supports_websockets
+        if !matches!(
+            self.state.controlled_response_config,
+            ControlledResponseConfig::Disabled
+        ) || !self.state.provider.info().supports_websockets
             || self.state.disable_websockets.load(Ordering::Relaxed)
         {
             return false;
         }
 
         true
+    }
+
+    pub(crate) fn ensure_realtime_allowed(&self) -> Result<()> {
+        self.ensure_controlled_response_endpoint("realtime")
+    }
+
+    fn ensure_controlled_response_endpoint(&self, endpoint: &str) -> Result<()> {
+        let message = match &self.state.controlled_response_config {
+            ControlledResponseConfig::Disabled => return Ok(()),
+            ControlledResponseConfig::Enabled { .. } => {
+                format!("controlled response mode does not permit requests to {endpoint}")
+            }
+            ControlledResponseConfig::Invalid(message) => message.clone(),
+        };
+        Err(self.state.provider.map_api_error(ApiError::Stream(message)))
     }
 
     /// Returns auth + provider configuration resolved from the current session auth state.

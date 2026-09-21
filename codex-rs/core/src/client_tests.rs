@@ -19,6 +19,12 @@ use crate::test_support::TestCodexResponsesRequestKind;
 use crate::test_support::responses_metadata as test_responses_metadata;
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
+use codex_api::RawMemory;
+use codex_api::RawMemoryMetadata;
+use codex_api::RealtimeEventParser;
+use codex_api::RealtimeOutputModality;
+use codex_api::RealtimeSessionConfig;
+use codex_api::RealtimeSessionMode;
 use codex_api::ResponseEvent;
 use codex_api::ResponsesEndpoint;
 use codex_api::TransportError;
@@ -59,6 +65,7 @@ use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::InternalSessionSource;
+use codex_protocol::protocol::RealtimeVoice;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_rollout_trace::ExecutionStatus;
@@ -1105,6 +1112,141 @@ async fn summarize_memories_returns_empty_for_empty_input() {
         .await
         .expect("empty summarize request should succeed");
     assert_eq!(output.len(), 0);
+}
+
+fn test_raw_memory() -> RawMemory {
+    RawMemory {
+        id: "trace-1".to_string(),
+        metadata: RawMemoryMetadata {
+            source_path: "/var/tmp/trace.json".to_string(),
+        },
+        items: vec![json!({"type": "message", "role": "user", "content": []})],
+    }
+}
+
+fn test_realtime_session_config() -> RealtimeSessionConfig {
+    RealtimeSessionConfig {
+        instructions: "test".to_string(),
+        initial_items: Vec::new(),
+        delegation_ack_filler: None,
+        model: Some("gpt-realtime".to_string()),
+        session_id: Some("session-test".to_string()),
+        event_parser: RealtimeEventParser::V1,
+        session_mode: RealtimeSessionMode::Conversational,
+        output_modality: RealtimeOutputModality::Audio,
+        voice: RealtimeVoice::Cove,
+    }
+}
+
+fn set_test_provider(client: &mut ModelClient, base_url: String, supports_websockets: bool) {
+    let mut provider = ModelProviderInfo::create_openai_provider(Some(base_url));
+    provider.requires_openai_auth = false;
+    provider.supports_websockets = supports_websockets;
+    Arc::get_mut(&mut client.state)
+        .expect("test client should have unique session state")
+        .provider = create_model_provider(provider, /*auth_manager*/ None);
+}
+
+#[tokio::test]
+#[serial_test::serial(controlled_response_env)]
+async fn controlled_response_invalid_output_only_latch_skips_websocket_prewarm()
+-> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(/*requests*/ 0)
+        .mount(&server)
+        .await;
+    let _restore = ControlledResponseEnv::set(None, Some(std::ffi::OsStr::new("512")));
+    let mut client = test_model_client(SessionSource::Exec);
+    let _clear_latched_environment = ControlledResponseEnv::set(None, None);
+    set_test_provider(&mut client, format!("{}/v1", server.uri()), true);
+
+    let metadata = test_responses_metadata_for_client(
+        &client,
+        /*turn_id*/ None,
+        format!("{}:0", client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Prewarm,
+    );
+    client
+        .new_session()
+        .preconnect_websocket(&test_model_info(), &test_session_telemetry(), &metadata)
+        .await?;
+    assert!(!client.responses_websocket_enabled());
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn controlled_response_refuses_side_endpoints_without_network_requests() -> anyhow::Result<()>
+{
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(/*requests*/ 0)
+        .mount(&server)
+        .await;
+    let mut client = controlled_response_client(16_384, 512);
+    set_test_provider(&mut client, format!("{}/v1", server.uri()), false);
+
+    let memory_result = client
+        .summarize_memories(
+            vec![test_raw_memory()],
+            &test_model_info(),
+            /*effort*/ None,
+            &test_session_telemetry(),
+        )
+        .await;
+    assert!(memory_result.is_err());
+
+    let realtime_result = client
+        .create_realtime_call_with_headers(
+            "v=offer\r\n".to_string(),
+            test_realtime_session_config(),
+            http::HeaderMap::new(),
+            /*api_provider_override*/ None,
+        )
+        .await;
+    assert!(realtime_result.is_err());
+
+    let existing_call_result = client
+        .realtime_sideband_headers(http::HeaderMap::new())
+        .await;
+    assert!(existing_call_result.is_err());
+    assert!(client.ensure_realtime_allowed().is_err());
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn uncontrolled_memory_summary_still_reaches_provider() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/memories/trace_summarize"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "output": [{
+                "trace_summary": "raw summary",
+                "memory_summary": "memory summary"
+            }]
+        })))
+        .expect(/*requests*/ 1)
+        .mount(&server)
+        .await;
+    let mut client = test_model_client(SessionSource::Cli);
+    set_test_provider(&mut client, format!("{}/v1", server.uri()), false);
+
+    let output = client
+        .summarize_memories(
+            vec![test_raw_memory()],
+            &test_model_info(),
+            /*effort*/ None,
+            &test_session_telemetry(),
+        )
+        .await?;
+    assert_eq!(output[0].memory_summary, "memory summary");
+    server.verify().await;
+    Ok(())
 }
 
 #[tokio::test]
