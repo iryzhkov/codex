@@ -754,6 +754,33 @@ impl RealtimeConversationManager {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) async fn start_direct_websocket_for_test(
+        &self,
+        api_provider: ApiProvider,
+        session_config: RealtimeSessionConfig,
+        model_client: ModelClient,
+    ) -> CodexResult<()> {
+        self.start_inner(RealtimeStart {
+            api_provider,
+            realtime_sideband_base_url: None,
+            extra_headers: None,
+            client_managed_handoffs: false,
+            flush_transcript_tail_on_session_end: false,
+            codex_responses_as_items: false,
+            codex_response_item_prefix: None,
+            codex_response_handoff_mode: CodexResponseHandoffMode::BemTags,
+            codex_response_handoff_channel_prefixes: None,
+            realtime_call_api_provider: None,
+            session_config,
+            model_client,
+            sdp: None,
+            existing_call_id: None,
+        })
+        .await
+        .map(drop)
+    }
+
     pub(crate) async fn register_fanout_task(
         &self,
         realtime_active: &Arc<AtomicBool>,
@@ -1232,6 +1259,7 @@ async fn prepare_realtime_start(
     sess: &Arc<Session>,
     params: ConversationStartParams,
 ) -> CodexResult<PreparedRealtimeConversationStart> {
+    sess.services.model_client.ensure_realtime_allowed()?;
     let provider = sess.provider().await;
     let auth_manager = sess
         .services

@@ -13,6 +13,7 @@ use super::controlled_response_required_context;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
+use crate::realtime_conversation::RealtimeConversationManager;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::test_support::TestCodexResponsesRequestKind;
@@ -1215,6 +1216,32 @@ async fn controlled_response_refuses_side_endpoints_without_network_requests() -
         .await;
     assert!(existing_call_result.is_err());
     assert!(client.ensure_realtime_allowed().is_err());
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn controlled_response_manager_refuses_direct_websocket_without_connection()
+-> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(/*requests*/ 0)
+        .mount(&server)
+        .await;
+    let mut client = controlled_response_client(16_384, 512);
+    set_test_provider(&mut client, format!("{}/v1", server.uri()), true);
+    let api_provider = client
+        .state
+        .provider
+        .info()
+        .to_api_provider(Some(AuthMode::ApiKey))?;
+
+    let result = RealtimeConversationManager::new()
+        .start_direct_websocket_for_test(api_provider, test_realtime_session_config(), client)
+        .await;
+
+    assert!(result.is_err());
     server.verify().await;
     Ok(())
 }
