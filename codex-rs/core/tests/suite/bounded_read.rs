@@ -9,8 +9,10 @@ use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_response_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
+use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
@@ -21,6 +23,7 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::ffi::OsStr;
 use std::ffi::OsString;
+use std::time::Duration;
 
 const ENV_KEYS: [&str; 5] = [
     "CODEX_BOUNDED_READ_MANIFEST",
@@ -263,6 +266,44 @@ async fn second_user_turn_is_rejected_before_another_post() -> Result<()> {
             assert!(format!("{terminal:?}").contains("budget-exhausted"));
         }
     }
+    assert_eq!(responses.requests().len(), 1);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+#[serial(bounded_read_env)]
+async fn stalled_stream_is_cut_off_by_session_deadline() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let _env = custody_env(&dir, "artifact", b"evidence");
+    let server = start_mock_server().await;
+    let responses = mount_response_once(
+        &server,
+        sse_response(sse(vec![
+            ev_response_created("resp-late"),
+            ev_assistant_message("msg-late", "too late"),
+            ev_completed("resp-late"),
+        ]))
+        .set_delay(Duration::from_secs(15 * 60 + 1)),
+    )
+    .await;
+    let fixture = test_codex().with_model("gpt-5.4").build(&server).await?;
+    fixture
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "wait".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(15 * 60 + 1)).await;
+    let terminal = wait_for_event(&fixture.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_) | EventMsg::Error(_))
+    })
+    .await;
+    assert!(matches!(terminal, EventMsg::Error(_)));
+    assert!(format!("{terminal:?}").contains("deadline-exceeded"));
     assert_eq!(responses.requests().len(), 1);
     Ok(())
 }
