@@ -408,11 +408,10 @@ async fn stalled_stream_is_cut_off_by_session_deadline() -> Result<()> {
             ev_assistant_message("msg-late", "too late"),
             ev_completed("resp-late"),
         ]))
-        .set_delay(Duration::from_secs(15 * 60 + 1)),
+        .set_delay(Duration::from_secs(16 * 60)),
     )
     .await;
     let fixture = test_codex().with_model("gpt-5.4").build(&server).await?;
-    tokio::time::pause();
     fixture
         .codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -420,22 +419,16 @@ async fn stalled_stream_is_cut_off_by_session_deadline() -> Result<()> {
             text_elements: Vec::new(),
         }]))
         .await?;
-    for _ in 0..1_000 {
-        if responses.requests().len() == 1 {
-            break;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while responses.requests().len() != 1 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(
-        responses.requests().len(),
-        1,
-        "request never reached server"
-    );
+    })
+    .await?;
+    assert_eq!(responses.requests().len(), 1);
+    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(15 * 60 + 1)).await;
     tokio::time::resume();
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-    }
     let terminal = wait_for_event(&fixture.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_) | EventMsg::Error(_))
     })
