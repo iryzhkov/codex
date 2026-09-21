@@ -1628,7 +1628,7 @@ async fn run_sampling_request(
             original_input = Some(prompt.input);
         }
 
-        if !err.is_retryable() {
+        if client_session.controlled_response_enabled() || !err.is_retryable() {
             return Err(err);
         }
 
@@ -2534,6 +2534,21 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::OutputItemDone(mut item) => {
+                if client_session.controlled_response_enabled()
+                    && matches!(
+                        &item,
+                        ResponseItem::FunctionCall { .. }
+                            | ResponseItem::CustomToolCall { .. }
+                            | ResponseItem::ToolSearchCall { .. }
+                            | ResponseItem::LocalShellCall { .. }
+                            | ResponseItem::WebSearchCall { .. }
+                            | ResponseItem::ImageGenerationCall { .. }
+                    )
+                {
+                    break Err(CodexErr::Stream(
+                        "controlled response mode rejected a tool-call output".to_string(),
+                    ));
+                }
                 assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
                 if analytics_tool_call_ids.len() < MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE {
                     let call_id = match &item {
@@ -2646,6 +2661,21 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::OutputItemAdded(mut item) => {
+                if client_session.controlled_response_enabled()
+                    && matches!(
+                        &item,
+                        ResponseItem::FunctionCall { .. }
+                            | ResponseItem::CustomToolCall { .. }
+                            | ResponseItem::ToolSearchCall { .. }
+                            | ResponseItem::LocalShellCall { .. }
+                            | ResponseItem::WebSearchCall { .. }
+                            | ResponseItem::ImageGenerationCall { .. }
+                    )
+                {
+                    break Err(CodexErr::Stream(
+                        "controlled response mode rejected a tool-call output".to_string(),
+                    ));
+                }
                 assign_missing_streamed_response_item_id(&mut item, /*active_item*/ None);
                 if let ResponseItem::CustomToolCall {
                     call_id,

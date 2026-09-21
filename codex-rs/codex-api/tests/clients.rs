@@ -353,6 +353,7 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
         service_tier: None,
         prompt_cache_key: None,
         text: None,
+        max_output_tokens: None,
         client_metadata: None,
         access_programs: None,
     };
@@ -441,6 +442,7 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
         service_tier: None,
         prompt_cache_key: None,
         text: None,
+        max_output_tokens: None,
         client_metadata: None,
         access_programs: None,
     };
@@ -475,6 +477,40 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
     );
     assert_eq!(requests[0].2, codex_client::RequestCompression::None);
     Ok(())
+}
+
+#[tokio::test]
+async fn streaming_client_with_single_attempt_never_retries_transport_error() {
+    let transport = FlakyTransport::new();
+    let mut provider = provider("openai");
+    provider.retry.max_attempts = 1;
+    provider.retry.retry_transport = false;
+    provider.retry.retry_429 = false;
+    provider.retry.retry_5xx = false;
+    let request = ResponsesApiRequest {
+        model: "gpt-test".into(),
+        instructions: String::new(),
+        input: Vec::new(),
+        tools: None,
+        tool_choice: "none".into(),
+        parallel_tool_calls: false,
+        reasoning: None,
+        store: false,
+        stream: true,
+        stream_options: None,
+        include: Vec::new(),
+        service_tier: None,
+        prompt_cache_key: None,
+        text: None,
+        max_output_tokens: Some(512),
+        client_metadata: None,
+        access_programs: None,
+    };
+    let client = ResponsesClient::new(transport.clone(), provider, Arc::new(NoAuth));
+
+    assert!(client.stream_request(request, ResponsesOptions::default()).await.is_err());
+    assert_eq!(transport.attempts(), 1);
+    assert_eq!(transport.requests().len(), 1);
 }
 
 #[tokio::test]
@@ -562,6 +598,7 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
         service_tier: None,
         prompt_cache_key: None,
         text: None,
+        max_output_tokens: None,
         client_metadata: None,
         access_programs: None,
     };

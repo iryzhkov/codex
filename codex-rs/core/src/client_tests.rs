@@ -12,6 +12,7 @@ use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
 use crate::responses_metadata::CodexResponsesMetadata;
+use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::test_support::TestCodexResponsesRequestKind;
 use crate::test_support::responses_metadata as test_responses_metadata;
 use codex_api::AgentIdentityTelemetry;
@@ -96,6 +97,115 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+struct ControlledResponseEnv;
+
+impl ControlledResponseEnv {
+    fn set(max_input_bytes: &str) -> Self {
+        unsafe {
+            std::env::set_var("T3_CODEX_CONTROLLED_RESPONSE_MAX_INPUT_BYTES", max_input_bytes);
+            std::env::set_var("T3_CODEX_CONTROLLED_RESPONSE_MAX_OUTPUT_TOKENS", "512");
+        }
+        Self
+    }
+}
+
+impl Drop for ControlledResponseEnv {
+    fn drop(&mut self) {
+        unsafe {
+            std::env::remove_var("T3_CODEX_CONTROLLED_RESPONSE_MAX_INPUT_BYTES");
+            std::env::remove_var("T3_CODEX_CONTROLLED_RESPONSE_MAX_OUTPUT_TOKENS");
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial(controlled_response_env)]
+fn controlled_response_enforces_request_limits_and_single_submission() {
+    let _env = ControlledResponseEnv::set("16384");
+
+    let client = test_model_client(SessionSource::Exec);
+    let mut session = client.new_session();
+    let prompt = Prompt::default();
+    let model_info = test_model_info();
+    let metadata = test_responses_metadata_for_client(
+        &client,
+        Some("turn-test"),
+        "window-test".to_string(),
+        None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let mut request = client
+        .build_responses_request(
+            &prompt,
+            &model_info,
+            None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            None,
+            &metadata,
+        )
+        .expect("request builds");
+
+    let encoded_len = session
+        .enforce_controlled_response(
+            &mut request,
+            &model_info,
+            false,
+            Some(CodexResponsesRequestKind::Turn),
+        )
+        .expect("first request is admitted")
+        .expect("controlled mode is enabled");
+    assert!(encoded_len <= 16384);
+    assert!(request.tools.is_none());
+    assert_eq!(request.tool_choice, "none");
+    assert!(!request.parallel_tool_calls);
+    assert_eq!(request.max_output_tokens, Some(512));
+
+    let mut second_session = client.new_session();
+    let second = second_session.enforce_controlled_response(
+            &mut request,
+            &model_info,
+            false,
+            Some(CodexResponsesRequestKind::Turn),
+        );
+    assert!(second.is_err(), "a second provider request must be refused");
+
+}
+
+#[test]
+#[serial_test::serial(controlled_response_env)]
+fn controlled_response_refuses_oversized_serialized_request() {
+    let _env = ControlledResponseEnv::set("1");
+
+    let client = test_model_client(SessionSource::Exec);
+    let mut session = client.new_session();
+    let prompt = Prompt::default();
+    let model_info = test_model_info();
+    let metadata = test_responses_metadata_for_client(
+        &client,
+        Some("turn-test"),
+        "window-test".to_string(),
+        None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let mut request = client
+        .build_responses_request(
+            &prompt,
+            &model_info,
+            None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            None,
+            &metadata,
+        )
+        .expect("request builds");
+    assert!(session.enforce_controlled_response(
+            &mut request,
+            &model_info,
+            false,
+            Some(CodexResponsesRequestKind::Turn),
+        ).is_err());
+
+}
 
 fn test_model_client(session_source: SessionSource) -> ModelClient {
     test_model_client_with_thread_id(ThreadId::new(), session_source)
@@ -253,6 +363,64 @@ fn responses_request_limits_raw_tool_metadata_to_resolved_first_party_https_endp
         }
     }
     Ok(())
+}
+
+async fn assert_controlled_response_status_is_not_retried(status: u16) -> anyhow::Result<()> {
+    let _env = ControlledResponseEnv::set("16384");
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(status))
+        .expect(/*requests*/ 1)
+        .mount(&server)
+        .await;
+    let mut provider =
+        ModelProviderInfo::create_openai_provider(Some(format!("{}/v1", server.uri())));
+    provider.requires_openai_auth = false;
+    provider.supports_websockets = true;
+    let mut client = test_model_client(SessionSource::Cli);
+    Arc::get_mut(&mut client.state)
+        .expect("test client should have unique session state")
+        .provider = create_model_provider(provider, /*auth_manager*/ None);
+    assert!(!client.responses_websocket_enabled());
+    let metadata = test_responses_metadata_for_client(
+        &client,
+        /*turn_id*/ None,
+        format!("{}:0", client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let result = client
+        .new_session()
+        .stream(
+            &Prompt::default(),
+            &test_model_info(),
+            &test_session_telemetry(),
+            /*effort*/ None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            /*service_tier*/ None,
+            &metadata,
+            &InferenceTraceContext::disabled(),
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(
+        server.received_requests().await.expect("received requests").len(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial(controlled_response_env)]
+async fn controlled_response_does_not_retry_429() -> anyhow::Result<()> {
+    assert_controlled_response_status_is_not_retried(429).await
+}
+
+#[tokio::test]
+#[serial_test::serial(controlled_response_env)]
+async fn controlled_response_does_not_retry_503() -> anyhow::Result<()> {
+    assert_controlled_response_status_is_not_retried(503).await
 }
 
 #[tokio::test]

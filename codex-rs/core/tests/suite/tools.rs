@@ -50,6 +50,27 @@ use serde_json::json;
 use test_case::test_case;
 use wiremock::ResponseTemplate;
 
+struct ControlledResponseEnv;
+
+impl ControlledResponseEnv {
+    fn set() -> Self {
+        unsafe {
+            std::env::set_var("T3_CODEX_CONTROLLED_RESPONSE_MAX_INPUT_BYTES", "1048576");
+            std::env::set_var("T3_CODEX_CONTROLLED_RESPONSE_MAX_OUTPUT_TOKENS", "512");
+        }
+        Self
+    }
+}
+
+impl Drop for ControlledResponseEnv {
+    fn drop(&mut self) {
+        unsafe {
+            std::env::remove_var("T3_CODEX_CONTROLLED_RESPONSE_MAX_INPUT_BYTES");
+            std::env::remove_var("T3_CODEX_CONTROLLED_RESPONSE_MAX_OUTPUT_TOKENS");
+        }
+    }
+}
+
 fn tool_names(body: &Value) -> Vec<String> {
     body.get("tools")
         .and_then(Value::as_array)
@@ -345,6 +366,71 @@ async fn custom_tool_unknown_returns_custom_output_error() -> Result<()> {
         "attempted-tool metadata must be disabled by default",
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial(controlled_response_env)]
+async fn controlled_response_rejects_malicious_tool_call_before_dispatch() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let _env = ControlledResponseEnv::set();
+    let server = start_mock_server().await;
+    let mut builder = test_codex();
+    let test = builder.build_with_auto_env(&server).await?;
+    let sentinel = test.workspace_path("controlled-response-tool-ran");
+    let arguments = serde_json::to_string(&json!({
+        "cmd": format!("touch {}", sentinel.display()),
+        "login": false,
+        "yield_time_ms": 10000,
+    }))?;
+    let mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_function_call("call-malicious", "exec_command", &arguments),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "attempt a tool call".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let EventMsg::Error(error) = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::Error(_))
+    })
+    .await
+    else {
+        unreachable!("event predicate guarantees an error");
+    };
+    assert_eq!(
+        error.message,
+        "stream disconnected before completion: controlled response mode rejected a tool-call output"
+    );
+    let EventMsg::TurnComplete(completed) = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await
+    else {
+        unreachable!("event predicate guarantees turn completion");
+    };
+    assert_eq!(completed.error, Some(error));
+    assert!(!sentinel.exists(), "the rejected tool call must not execute");
+    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .context("mock server should expose received requests")?
+            .iter()
+            .filter(|request| request.url.path() == "/v1/responses")
+            .count(),
+        1,
+        "the rejected tool call must not dispatch or produce a continuation request"
+    );
     Ok(())
 }
 

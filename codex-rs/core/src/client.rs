@@ -125,6 +125,7 @@ use crate::context::ContextualUserFragment;
 use crate::cyber_access_program;
 use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
+use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::subagent_header_value;
 use crate::util::emit_feedback_auth_recovery_tags;
 use codex_feedback::FeedbackRequestTags;
@@ -190,6 +191,48 @@ fn session_telemetry_for_request(
 /// This is intentionally kept minimal so `ModelClient` does not need to hold a full `Config`. Most
 /// configuration is per turn and is passed explicitly to streaming/unary methods.
 #[derive(Debug)]
+enum ControlledResponseConfig {
+    Disabled,
+    Enabled { max_input: usize, max_output: u64 },
+    Invalid(String),
+}
+
+impl ControlledResponseConfig {
+    fn from_env() -> Self {
+        const INPUT_ENV: &str = "T3_CODEX_CONTROLLED_RESPONSE_MAX_INPUT_BYTES";
+        const OUTPUT_ENV: &str = "T3_CODEX_CONTROLLED_RESPONSE_MAX_OUTPUT_TOKENS";
+        let (input, output) = match (
+            std::env::var_os(INPUT_ENV),
+            std::env::var_os(OUTPUT_ENV),
+        ) {
+            (None, None) => return Self::Disabled,
+            (Some(input), Some(output)) => (input, output),
+            _ => {
+                return Self::Invalid(format!(
+                    "{INPUT_ENV} and {OUTPUT_ENV} must be set together"
+                ));
+            }
+        };
+        let Some(input) = input.to_str() else {
+            return Self::Invalid(format!("{INPUT_ENV} must be valid UTF-8"));
+        };
+        let Some(output) = output.to_str() else {
+            return Self::Invalid(format!("{OUTPUT_ENV} must be valid UTF-8"));
+        };
+        let Ok(max_input) = input.parse::<usize>() else {
+            return Self::Invalid(format!("{INPUT_ENV} must be a positive integer"));
+        };
+        let Ok(max_output) = output.parse::<u64>() else {
+            return Self::Invalid(format!("{OUTPUT_ENV} must be a positive integer"));
+        };
+        if max_input == 0 || max_output == 0 {
+            return Self::Invalid("controlled response limits must be positive".to_string());
+        }
+        Self::Enabled { max_input, max_output }
+    }
+}
+
+#[derive(Debug)]
 struct ModelClientState {
     thread_id: ThreadId,
     provider: SharedModelProvider,
@@ -205,6 +248,8 @@ struct ModelClientState {
     include_attestation: bool,
     attestation_provider: Option<Arc<dyn AttestationProvider>>,
     disable_websockets: AtomicBool,
+    controlled_response_config: ControlledResponseConfig,
+    controlled_response_submitted: AtomicBool,
     agent_identity_session_fallback: AgentIdentitySessionFallback,
     cached_websocket_session: StdMutex<WebsocketSession>,
 }
@@ -324,6 +369,7 @@ fn responses_request_properties_match(
         service_tier: previous_service_tier,
         prompt_cache_key: previous_prompt_cache_key,
         text: previous_text,
+        max_output_tokens: previous_max_output_tokens,
         client_metadata: _,
         access_programs: _,
     } = previous;
@@ -342,6 +388,7 @@ fn responses_request_properties_match(
         service_tier: current_service_tier,
         prompt_cache_key: current_prompt_cache_key,
         text: current_text,
+        max_output_tokens: current_max_output_tokens,
         client_metadata: _,
         access_programs: _,
     } = current;
@@ -360,6 +407,7 @@ fn responses_request_properties_match(
         && previous_service_tier == current_service_tier
         && previous_prompt_cache_key == current_prompt_cache_key
         && previous_text == current_text
+        && previous_max_output_tokens == current_max_output_tokens
 }
 
 fn response_items_equal_ignoring_internal_metadata(
@@ -468,6 +516,8 @@ impl ModelClient {
                 include_attestation,
                 attestation_provider,
                 disable_websockets: AtomicBool::new(false),
+                controlled_response_config: ControlledResponseConfig::from_env(),
+                controlled_response_submitted: AtomicBool::new(false),
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
             }),
@@ -883,6 +933,7 @@ impl ModelClient {
             service_tier,
             prompt_cache_key,
             text,
+            max_output_tokens: None,
             client_metadata: Some(responses_metadata.client_metadata()),
             access_programs: None,
         };
@@ -924,6 +975,9 @@ impl ModelClient {
     ///
     /// WebSocket use is controlled by provider capability and session-scoped fallback state.
     pub fn responses_websocket_enabled(&self) -> bool {
+        if std::env::var_os("T3_CODEX_CONTROLLED_RESPONSE_MAX_INPUT_BYTES").is_some() {
+            return false;
+        }
         if !self.state.provider.info().supports_websockets
             || self.state.disable_websockets.load(Ordering::Relaxed)
         {
@@ -1195,6 +1249,115 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
+    pub(crate) fn controlled_response_enabled(&self) -> bool {
+        !matches!(
+            self.client.state.controlled_response_config,
+            ControlledResponseConfig::Disabled
+        )
+    }
+
+    fn controlled_response_limits(&self) -> Result<Option<(usize, u64)>> {
+        match &self.client.state.controlled_response_config {
+            ControlledResponseConfig::Disabled => Ok(None),
+            ControlledResponseConfig::Enabled {
+                max_input,
+                max_output,
+            } => Ok(Some((*max_input, *max_output))),
+            ControlledResponseConfig::Invalid(message) => Err(self
+                .client
+                .state
+                .provider
+                .map_api_error(ApiError::Stream(message.clone()))),
+        }
+    }
+
+    fn enforce_controlled_response(
+        &mut self,
+        request: &mut ResponsesApiRequest,
+        model_info: &ModelInfo,
+        use_responses_lite: bool,
+        request_kind: Option<CodexResponsesRequestKind>,
+    ) -> Result<Option<usize>> {
+        let Some((max_input, max_output)) = self.controlled_response_limits()? else {
+            return Ok(None);
+        };
+        const FRAMING_RESERVE_TOKENS: u64 = 4096;
+        if model_info.used_fallback_model_metadata || request.model != model_info.slug {
+            return Err(self.client.state.provider.map_api_error(ApiError::Stream(
+                "controlled response mode requires verified metadata for the selected model"
+                    .to_string(),
+            )));
+        }
+        let context_window = model_info
+            .resolved_context_window()
+            .and_then(|value| u64::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                self.client.state.provider.map_api_error(ApiError::Stream(
+                    "controlled response mode requires a positive model context window".to_string(),
+                ))
+            })?;
+        if self.client.free_guardian_enabled {
+            return Err(self.client.state.provider.map_api_error(ApiError::Stream(
+                "controlled response mode does not support side inference".to_string(),
+            )));
+        }
+        if !matches!(request_kind, Some(CodexResponsesRequestKind::Turn)) {
+            return Err(self.client.state.provider.map_api_error(ApiError::Stream(
+                "controlled response mode only permits a primary turn request".to_string(),
+            )));
+        }
+        if use_responses_lite {
+            return Err(self.client.state.provider.map_api_error(ApiError::Stream(
+                "controlled response mode does not support responses-lite".to_string(),
+            )));
+        }
+        if self
+            .client
+            .state
+            .controlled_response_submitted
+            .swap(true, Ordering::AcqRel)
+        {
+            return Err(self.client.state.provider.map_api_error(ApiError::Stream(
+                "controlled response mode refuses a second provider request".to_string(),
+            )));
+        }
+        // Controlled responses receive their complete role and evidence in the caller's
+        // input package; omit the interactive agent harness instructions and capabilities.
+        request.instructions.clear();
+        request.tools = None;
+        request.access_programs = None;
+        request.tool_choice = "none".to_string();
+        request.parallel_tool_calls = false;
+        request.max_output_tokens = Some(max_output);
+        let encoded = serde_json::to_vec(request).map_err(|err| {
+            self.client.state.provider.map_api_error(ApiError::Stream(format!(
+                "failed to encode controlled response request: {err}"
+            )))
+        })?;
+        let required_context = u64::try_from(encoded.len())
+            .ok()
+            .and_then(|input| input.checked_add(max_output))
+            .and_then(|total| total.checked_add(FRAMING_RESERVE_TOKENS))
+            .ok_or_else(|| {
+                self.client.state.provider.map_api_error(ApiError::Stream(
+                    "controlled response context accounting overflowed".to_string(),
+                ))
+            })?;
+        if required_context > context_window {
+            return Err(self.client.state.provider.map_api_error(ApiError::Stream(format!(
+                "controlled response requires {required_context} conservative context tokens, model limit is {context_window}"
+            ))));
+        }
+        if encoded.len() > max_input {
+            return Err(self.client.state.provider.map_api_error(ApiError::Stream(format!(
+                "controlled response request is {} bytes, limit is {max_input}",
+                encoded.len()
+            ))));
+        }
+        Ok(Some(encoded.len()))
+    }
+
     fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
         self.websocket_session.endpoint = None;
@@ -1476,7 +1639,7 @@ impl ModelClientSession {
         )
     )]
     async fn stream_responses_api(
-        &self,
+        &mut self,
         prompt: &Prompt,
         model_info: &ModelInfo,
         session_telemetry: &SessionTelemetry,
@@ -1560,6 +1723,12 @@ impl ModelClientSession {
             );
             self.client
                 .prepare_response_items_for_request(&mut request.input);
+            let controlled_request_bytes = self.enforce_controlled_response(
+                &mut request,
+                model_info,
+                model_info.use_responses_lite,
+                responses_metadata.request_kind,
+            )?;
             if crate::guardian::is_basic_session_source(&self.client.state.session_source) {
                 crate::guardian::observe_guardian_request(session_telemetry, &request);
             }
@@ -1568,11 +1737,14 @@ impl ModelClientSession {
             let inference_trace_attempt = inference_trace.start_attempt();
             inference_trace_attempt.add_request_headers(&mut options.extra_headers);
             inference_trace_attempt.record_started(&request);
-            let client = ApiResponsesClient::new(
-                transport,
-                client_setup.api_provider,
-                client_setup.api_auth,
-            )
+            let mut api_provider = client_setup.api_provider;
+            if controlled_request_bytes.is_some() {
+                api_provider.retry.max_attempts = 1;
+                api_provider.retry.retry_429 = false;
+                api_provider.retry.retry_5xx = false;
+                api_provider.retry.retry_transport = false;
+            }
+            let client = ApiResponsesClient::new(transport, api_provider, client_setup.api_auth)
             .with_endpoint(endpoint)
             .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
             let stream_result = client.stream_request(request, options).await;
@@ -1697,6 +1869,14 @@ impl ModelClientSession {
                 client_setup.auth.as_ref(),
                 prompt.cyber_access_program,
             );
+            if !warmup {
+                self.enforce_controlled_response(
+                    &mut request,
+                    model_info,
+                    model_info.use_responses_lite,
+                    responses_metadata.request_kind,
+                )?;
+            }
             let mut websocket_metadata = responses_metadata.clone();
             websocket_metadata.routing_hint = if endpoint == ResponsesEndpoint::Responses {
                 self.client.build_routing_hint_header(
