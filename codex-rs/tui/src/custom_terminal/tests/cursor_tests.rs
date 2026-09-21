@@ -4,6 +4,7 @@ use pretty_assertions::assert_eq;
 
 #[test]
 fn terminal_draw_repairs_styled_anchor_on_cursor_only_frames() {
+    crossterm::style::force_color_output(true);
     let mut terminal =
         Terminal::with_options(CaptureBackend::new(/*width*/ 12, /*height*/ 2)).expect("terminal");
     let area = Rect::new(
@@ -49,6 +50,7 @@ fn terminal_draw_repairs_styled_anchor_on_cursor_only_frames() {
 
 #[test]
 fn terminal_draw_repairs_owned_wide_hyperlink_after_skipped_glyphs() {
+    crossterm::style::force_color_output(true);
     let mut terminal =
         Terminal::with_options(CaptureBackend::new(/*width*/ 8, /*height*/ 1)).expect("terminal");
     let area = Rect::new(
@@ -77,6 +79,7 @@ fn terminal_draw_repairs_owned_wide_hyperlink_after_skipped_glyphs() {
 
 #[test]
 fn terminal_draw_repairs_single_column_without_scrolling() {
+    crossterm::style::force_color_output(true);
     let mut terminal =
         Terminal::with_options(CaptureBackend::new(/*width*/ 1, /*height*/ 1)).expect("terminal");
     let area = Rect::new(
@@ -108,6 +111,7 @@ fn terminal_draw_repairs_single_column_without_scrolling() {
 
 #[test]
 fn terminal_draw_omits_cursor_style_without_an_owned_glyph() {
+    crossterm::style::force_color_output(true);
     let mut terminal =
         Terminal::with_options(CaptureBackend::new(/*width*/ 2, /*height*/ 1)).expect("terminal");
     for width in [0, 2] {
