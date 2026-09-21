@@ -621,7 +621,7 @@ fn open_os_root() -> Result<File, BoundedReadError> {
     File::open("/").map_err(|error| invalid(format!("open custody root: {error}")))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn open_relative(root: &File, path: &Path, directory: bool) -> Result<File, BoundedReadError> {
     use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
@@ -648,6 +648,11 @@ fn open_relative(root: &File, path: &Path, directory: bool) -> Result<File, Boun
         current = unsafe { File::from_raw_fd(fd) };
     }
     Ok(current)
+}
+
+#[cfg(not(unix))]
+fn open_relative(_root: &File, _path: &Path, _directory: bool) -> Result<File, BoundedReadError> {
+    Err(invalid("rooted custody reads are unsupported on this platform"))
 }
 
 fn validate_digest(value: &str) -> Result<(), BoundedReadError> {
