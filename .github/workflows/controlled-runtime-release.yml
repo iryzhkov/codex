@@ -107,12 +107,52 @@ jobs:
           set -euo pipefail
           bazel build //third_party/voice:native_sdk //third_party/voice:native_link //third_party/voice:pkg_config
 
-          sdk="$(readlink -f bazel-bin/third_party/voice/native_runtime_linux_x86_64_sdk)"
-          native_lib="$(readlink -f bazel-bin/third_party/voice/native_link_linux_x86_64/lib)"
-          pkg_config_tool="$(readlink -f bazel-bin/third_party/voice/pkg_config_unix/bin/pkg-config-tool)"
+          query_declared_outputs() {
+            local label="$1"
+            local destination="$2"
+            local output
+            output="$(bazel cquery --output=files "$label")"
+            if [[ -z "$output" ]]; then
+              echo "Bazel reported no declared outputs for $label" >&2
+              return 1
+            fi
+            mapfile -t "$destination" <<<"$output"
+          }
+
+          query_declared_outputs //third_party/voice:native_sdk sdk_outputs
+          query_declared_outputs //third_party/voice:native_link native_link_outputs
+          query_declared_outputs //third_party/voice:pkg_config pkg_config_outputs
+
+          printf 'native_sdk declared outputs:\n%s\n' "${sdk_outputs[*]:-<none>}"
+          printf 'native_link declared outputs:\n%s\n' "${native_link_outputs[*]:-<none>}"
+          printf 'pkg_config declared outputs:\n%s\n' "${pkg_config_outputs[*]:-<none>}"
+
+          test "${#sdk_outputs[@]}" -eq 1
+          test "${#native_link_outputs[@]}" -eq 1
+          sdk="$(readlink -f "${sdk_outputs[0]}")"
+          native_link_marker="$(readlink -f "${native_link_outputs[0]}")"
+          test "$(basename "$native_link_marker")" = search-path
+          native_lib="$(dirname "$native_link_marker")"
+
+          pkg_config_tool=
+          for candidate in "${pkg_config_outputs[@]}"; do
+            case "$candidate" in
+              */bin/pkg-config-tool)
+                candidate="$(readlink -f "$candidate")"
+                if [[ -x "$candidate" ]]; then
+                  pkg_config_tool="$candidate"
+                  break
+                fi
+                ;;
+            esac
+          done
+
           test -d "$sdk/lib/pkgconfig"
           test -d "$native_lib"
+          test -n "$pkg_config_tool"
           test -x "$pkg_config_tool"
+          printf 'resolved native_sdk=%s\nresolved native_lib=%s\nresolved pkg_config=%s\n' \
+            "$sdk" "$native_lib" "$pkg_config_tool"
 
           pkg_config_wrapper="$RUNNER_TEMP/voice-pkg-config"
           cat >"$pkg_config_wrapper" <<EOF
