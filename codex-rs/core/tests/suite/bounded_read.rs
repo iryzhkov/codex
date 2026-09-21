@@ -36,6 +36,12 @@ const ENV_KEYS: [&str; 5] = [
 struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
 
 impl EnvGuard {
+    fn set_one(key: &'static str, value: &OsStr) -> Self {
+        let old = vec![(key, std::env::var_os(key))];
+        unsafe { std::env::set_var(key, value) };
+        Self(old)
+    }
+
     fn set(values: [(&'static str, &OsStr); 5]) -> Self {
         let old = values
             .iter()
@@ -101,6 +107,23 @@ fn tool_names(body: &Value) -> Vec<&str> {
         .flatten()
         .filter_map(|tool| tool["name"].as_str())
         .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(bounded_read_env)]
+async fn incomplete_custody_fails_during_session_spawn() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let manifest_path = dir.path().join("manifest.json");
+    std::fs::write(&manifest_path, b"{}")?;
+    let _env = EnvGuard::set_one(ENV_KEYS[0], manifest_path.as_os_str());
+    let server = start_mock_server().await;
+
+    let error = match test_codex().with_model("gpt-5.4").build(&server).await {
+        Ok(_) => anyhow::bail!("incomplete custody unexpectedly started a session"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("bounded read environment is incomplete"));
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

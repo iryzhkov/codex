@@ -526,6 +526,10 @@ impl Session {
     }
 
     async fn spawn_internal(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
+        // Parse and validate custody before any session startup work can observe ambient state.
+        let bounded_read_session = crate::bounded_read::BoundedReadSession::from_env()
+            .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+        let bounded_read_enabled = bounded_read_session.is_some();
         let SessionSpawnArgs {
             mut config,
             allow_provider_model_fallback,
@@ -569,6 +573,37 @@ impl Session {
             git_enrichment_policy,
             windows_sandbox_proxy_settings_mode,
         } = args;
+        if bounded_read_enabled {
+            if !matches!(conversation_history, InitialHistory::New | InitialHistory::Cleared) {
+                return Err(CodexErr::InvalidRequest(
+                    "bounded read requires a fresh conversation".to_string(),
+                ));
+            }
+            if !dynamic_tools.is_empty() {
+                return Err(CodexErr::InvalidRequest(
+                    "bounded read does not support dynamic tools".to_string(),
+                ));
+            }
+            config.mcp_servers = codex_config::Constrained::allow_any(Default::default());
+            config.permissions.network = None;
+            config.memories.generate_memories = false;
+            config.notify = None;
+            config.developer_instructions = None;
+            config.include_apps_instructions = false;
+            config.include_skill_instructions = false;
+            config.include_environment_context = false;
+            config.current_time_reminder = None;
+        }
+        let client_mcp_extensions = if bounded_read_enabled {
+            Default::default()
+        } else {
+            client_mcp_extensions
+        };
+        let inherited_environments = if bounded_read_enabled {
+            None
+        } else {
+            inherited_environments
+        };
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
 
@@ -580,10 +615,14 @@ impl Session {
         config
             .startup_warnings
             .extend(user_instruction_provider_warnings);
-        let isolation = thread_extension_init
-            .get::<codex_extension_api::SessionIsolation>()
-            .map(|policy| *policy)
-            .unwrap_or_default();
+        let isolation = if bounded_read_enabled {
+            codex_extension_api::SessionIsolation::Isolated
+        } else {
+            thread_extension_init
+                .get::<codex_extension_api::SessionIsolation>()
+                .map(|policy| *policy)
+                .unwrap_or_default()
+        };
         let exec_policy = if isolation == codex_extension_api::SessionIsolation::Isolated {
             let managed_policy = config
                 .config_layer_stack
@@ -621,7 +660,7 @@ impl Session {
         };
 
         let mut config = Arc::new(config);
-        let refresh_strategy = if session_source.is_non_root_agent() {
+        let refresh_strategy = if bounded_read_enabled || session_source.is_non_root_agent() {
             codex_models_manager::manager::RefreshStrategy::Offline
         } else {
             codex_models_manager::manager::RefreshStrategy::OnlineIfUncached
@@ -816,8 +855,19 @@ impl Session {
         let session_source_clone = session_configuration.session_source.clone();
         let (agent_status_tx, agent_status_rx) = watch::channel(AgentStatus::PendingInit);
 
+        let extensions = if bounded_read_enabled {
+            codex_extension_api::empty_extension_registry()
+        } else {
+            extensions
+        };
+        let user_instructions = if bounded_read_enabled {
+            None
+        } else {
+            user_instructions
+        };
         let session = Box::pin(Session::new(
             session_configuration,
+            bounded_read_session,
             &environment_selections,
             config.clone(),
             user_instructions,

@@ -664,6 +664,7 @@ impl Session {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
         mut session_configuration: SessionConfiguration,
+        bounded_read_session: Option<Arc<crate::bounded_read::BoundedReadSession>>,
         environment_selections: &[TurnEnvironmentSelection],
         config: Arc<Config>,
         user_instructions: Option<codex_extension_api::Instructions>,
@@ -698,6 +699,7 @@ impl Session {
         git_enrichment_policy: GitEnrichmentPolicy,
         windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
     ) -> anyhow::Result<Arc<Self>> {
+        let bounded_read_enabled = bounded_read_session.is_some();
         debug!(
             "Configuring session: model={}; provider={:?}",
             session_configuration
@@ -1002,7 +1004,7 @@ impl Session {
             .unwrap_or_else(|| session_configuration.cwd().to_path_buf());
         let auth_and_mcp_fut = async move {
             let auth = auth_manager_clone.auth().await;
-            if config_for_mcp.features.plugin_recommendations_enabled() {
+            if !bounded_read_enabled && config_for_mcp.features.plugin_recommendations_enabled() {
                 let plugins_config = config_for_mcp.plugins_config_input();
                 let auth_for_prewarm = auth.clone();
                 // Fetch the catalog while MCP and plugin/skill initialization continue.
@@ -1298,37 +1300,42 @@ impl Session {
             );
             let resolved_environments = turn_environments.snapshot().await;
             let agents_md_manager = Arc::new(AgentsMdManager::new(user_instructions));
-            let plugin_skill_warmup = warm_plugins_and_skills_for_session_init(
-                Arc::clone(&config),
-                Arc::clone(&plugins_manager),
-                Arc::clone(&skills_service),
-                &resolved_environments,
-                extensions.as_ref(),
-            )
-            .instrument(info_span!(
-                "session_init.plugin_skill_warmup",
-                otel.name = "session_init.plugin_skill_warmup",
-            ));
             let thread_name_lookup =
                 thread_title_from_thread_store(live_thread_init.as_ref(), &thread_store, thread_id)
                     .instrument(info_span!(
                         "session_init.thread_name_lookup",
                         otel.name = "session_init.thread_name_lookup",
                     ));
-            let (agents_md_result, plugin_skill_errors, thread_name) = tokio::join!(
-                agents_md_manager.refresh(config.as_ref(), &resolved_environments),
-                plugin_skill_warmup,
-                thread_name_lookup,
-            );
-            // TODO(anp): Present AGENTS.md discovery errors more clearly to the user.
-            agents_md_result?;
-            for err in &plugin_skill_errors {
-                error!(
-                    "failed to load skill {}: {}",
-                    err.path.display(),
-                    err.message
+            let thread_name = if bounded_read_enabled {
+                thread_name_lookup.await
+            } else {
+                let plugin_skill_warmup = warm_plugins_and_skills_for_session_init(
+                    Arc::clone(&config),
+                    Arc::clone(&plugins_manager),
+                    Arc::clone(&skills_service),
+                    &resolved_environments,
+                    extensions.as_ref(),
+                )
+                .instrument(info_span!(
+                    "session_init.plugin_skill_warmup",
+                    otel.name = "session_init.plugin_skill_warmup",
+                ));
+                let (agents_md_result, plugin_skill_errors, thread_name) = tokio::join!(
+                    agents_md_manager.refresh(config.as_ref(), &resolved_environments),
+                    plugin_skill_warmup,
+                    thread_name_lookup,
                 );
-            }
+                // TODO(anp): Present AGENTS.md discovery errors more clearly to the user.
+                agents_md_result?;
+                for err in &plugin_skill_errors {
+                    error!(
+                        "failed to load skill {}: {}",
+                        err.path.display(),
+                        err.message
+                    );
+                }
+                thread_name
+            };
             session_configuration.thread_name = thread_name.clone();
             let mut state = SessionState::new_with_auto_compact_window_ids(
                 session_configuration.clone(),
@@ -1414,12 +1421,25 @@ impl Session {
             let mcp_runtime = Arc::new(McpRuntime::empty(
                 mcp_projection.config.prefix_mcp_tool_names,
             ));
-            let hooks_config = build_hooks_config(
-                &config,
-                plugins_manager.as_ref(),
-                resolved_environments.single_local_environment(),
-            )
-            .await;
+            let hooks_config = if bounded_read_enabled {
+                HooksConfig {
+                    legacy_notify_argv: None,
+                    feature_enabled: false,
+                    bypass_hook_trust: false,
+                    config_layer_stack: None,
+                    plugin_hook_sources: Vec::new(),
+                    plugin_hook_load_warnings: Vec::new(),
+                    shell_program: None,
+                    shell_args: Vec::new(),
+                }
+            } else {
+                build_hooks_config(
+                    &config,
+                    plugins_manager.as_ref(),
+                    resolved_environments.single_local_environment(),
+                )
+                .await
+            };
             let (hooks, async_hook_results) = Hooks::new(
                 hooks_config,
                 thread_id,
@@ -1558,6 +1578,7 @@ impl Session {
                     attestation_provider,
                     config.http_client_factory(),
                 )
+                .with_bounded_read_session(bounded_read_session)
                 .with_free_guardian_enabled(config.free_guardian_enabled())
                 .with_session_context(
                     crate::guardian::prompt_cache_key_override_for_review_session(
