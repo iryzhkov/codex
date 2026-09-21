@@ -115,10 +115,19 @@ fn effective_workspace_intersection_preserves_network_metadata_and_temp() {
     let result = intersection(&authority, &requested, &project);
     let policy = result.file_system_sandbox_policy();
 
+    // The fixture itself lives below the process temp directory, so the preserved
+    // :tmpdir write grant also makes both paths effectively writable. Remove that
+    // independent grant when checking the workspace intersection.
+    let mut workspace_policy = policy.clone();
+    workspace_policy.entries.retain(|entry| {
+        entry.path
+            != FileSystemPath::Special {
+                value: FileSystemSpecialPath::Tmpdir,
+            }
+    });
     assert_eq!(
-        [&root, &project]
-            .map(|path| policy
-                .resolve_access_for_local_path_with_cwd(path.as_path(), root.as_path())),
+        [&root, &project].map(|path| workspace_policy
+            .resolve_access_for_local_path_with_cwd(path.as_path(), root.as_path())),
         [Read, Write]
     );
     assert_eq!(result.network_sandbox_policy(), Restricted);
