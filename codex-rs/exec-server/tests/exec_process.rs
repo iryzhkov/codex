@@ -215,6 +215,11 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
     }
     let context = create_process_context(use_remote).await?;
     let home = TempDir::new()?;
+    // Bubblewrap needs existing protected-metadata mount targets on filesystems
+    // where creating a synthetic target is unavailable (for example, quota-managed btrfs).
+    if use_remote {
+        std::fs::create_dir(home.path().join(".git"))?;
+    }
     let cwd = PathUri::from_host_native_path(home.path())?;
     let (shell_path, profile_name) = match shell_name {
         "bash" if automatic_startup => ("/bin/bash", ".bash-env"),
@@ -232,7 +237,7 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
     let wc = profile_path_entry.join("wc");
     std::fs::write(
         &wc,
-        "#!/bin/sh\nprintf x >> \"$HOME/tool-captures\"\nexec /usr/bin/wc \"$@\"\n",
+        "#!/bin/sh\n{ printf x >> \"$HOME/tool-captures\"; } 2>/dev/null || :\nexec /usr/bin/wc \"$@\"\n",
     )?;
     std::fs::set_permissions(&wc, std::fs::Permissions::from_mode(0o755))?;
     let posix_shell = matches!(shell_name, "sh" | "bash-sh");
@@ -252,7 +257,7 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
     std::fs::write(
         &profile_path,
         format!(
-            "printf x >> \"$HOME/captures\"\nexport PATH=\"$HOME/profile-bin:/usr/bin:/bin\"\nexport PROFILE_ALLOWED=profile\nexport PROFILE_SECRET=secret\nexport PROFILE_DENIED=denied\nprofile_helper() {{ printf helper; }}\nif [ -n \"${{BASH_VERSION-}}\" ]; then\n  shopt -s extglob nocasematch\n  eval 'profile_helper() {{ case $1 in @(foo|bar)*) printf helper ;; *) return 1 ;; esac; }}'\nfi\nset -u\n{shadowed_builtins}{padding}"
+            "if [ -z \"${{PROFILE_LOADED-}}\" ]; then\n  {{ printf x >> \"$HOME/captures\"; }} 2>/dev/null || :\n  export PROFILE_LOADED=1\n  export PATH=\"$HOME/profile-bin:/usr/bin:/bin\"\n  export PROFILE_ALLOWED=profile\n  export PROFILE_SECRET=secret\n  export PROFILE_DENIED=denied\n  profile_helper() {{ printf helper; }}\n  if [ -n \"${{BASH_VERSION-}}\" ]; then\n    shopt -s extglob nocasematch\n    eval 'profile_helper() {{ case $1 in @(foo|bar)*) printf helper ;; *) return 1 ;; esac; }}'\n  fi\n  set -u\n{shadowed_builtins}{padding}fi\n"
         ),
     )?;
     if shell_name == "zsh" && automatic_startup {
@@ -360,6 +365,8 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
         );
     }
 
+    // The sandboxed capture cannot write HOME; the sole marker comes from the
+    // following unsandboxed request and also proves its snapshot stays cached.
     assert_eq!(std::fs::read_to_string(home.path().join("captures"))?, "x");
     assert!(!std::fs::read(home.path().join("tool-captures"))?.is_empty());
     if let Some(server) = context._server {
@@ -477,6 +484,11 @@ async fn shell_snapshot_v2_capture_failure_falls_back_and_retries(
     }
     let context = create_process_context(use_remote).await?;
     let home = TempDir::new()?;
+    // Bubblewrap needs existing protected-metadata mount targets on filesystems
+    // where creating a synthetic target is unavailable (for example, quota-managed btrfs).
+    if use_remote {
+        std::fs::create_dir(home.path().join(".git"))?;
+    }
     let cwd = PathUri::from_host_native_path(home.path())?;
     let (shell_path, profile_name) = match shell_name {
         "bash" => ("/bin/bash", ".bashrc"),
@@ -485,7 +497,7 @@ async fn shell_snapshot_v2_capture_failure_falls_back_and_retries(
     };
     std::fs::write(
         home.path().join(profile_name),
-        "printf x >> \"$HOME/captures\"\nexit 7\n",
+        "if [ -z \"${SNAPSHOT_PROFILE_LOADED-}\" ]; then\n  printf x >> \"$HOME/captures\"\n  export SNAPSHOT_PROFILE_LOADED=1\nfi\nexit 7\n",
     )?;
     let policy = ExecEnvPolicy {
         inherit: ShellEnvironmentPolicyInherit::All,
@@ -495,7 +507,11 @@ async fn shell_snapshot_v2_capture_failure_falls_back_and_retries(
             "HOME".to_string(),
             home.path().to_string_lossy().into_owned(),
         )]),
-        include_only: vec!["HOME".to_string(), "PATH".to_string()],
+        include_only: vec![
+            "HOME".to_string(),
+            "PATH".to_string(),
+            "SNAPSHOT_PROFILE_LOADED".to_string(),
+        ],
     };
     let mut params = ExecParams {
         metadata: Default::default(),
@@ -548,7 +564,7 @@ async fn shell_snapshot_v2_capture_failure_falls_back_and_retries(
 
     std::fs::write(
         home.path().join(profile_name),
-        "printf x >> \"$HOME/captures\"\nprofile_helper() { printf recovered; }\n",
+        "if [ -z \"${SNAPSHOT_PROFILE_LOADED-}\" ]; then\n  printf x >> \"$HOME/captures\"\n  export SNAPSHOT_PROFILE_LOADED=1\nfi\nprofile_helper() { printf recovered; }\n",
     )?;
     let (expected_output, expected_captures) = if failures_before_repair == 3 {
         ("original", "xxx")
