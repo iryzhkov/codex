@@ -410,7 +410,8 @@ async fn repo_ancestry_without_project_marker_does_not_walk_parents() {
         ConfigLayerSource::SessionFlags,
         toml::toml! {
             project_root_markers = ["fixture-project-root-marker"]
-        },
+        }
+        .into(),
     )]);
     let roots = repo_agents_skill_roots(Some(Arc::clone(&LOCAL_FS)), &config_stack, &cwd)
         .await
