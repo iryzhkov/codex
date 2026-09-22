@@ -386,6 +386,7 @@ jobs:
       - name: Verify portability and write build receipt
         shell: bash
         env:
+          CARGO_VERSION: ${{ needs.quality-gate.outputs.version }}
           SOURCE_COMMIT: ${{ needs.quality-gate.outputs.commit }}
           SOURCE_TREE: ${{ needs.quality-gate.outputs.tree }}
         run: |
@@ -415,42 +416,53 @@ jobs:
             echo "Voice host has unresolved native dependencies" >&2
             exit 1
           fi
-          voice_ldd_json="$(printf '%s\n' "$voice_ldd" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
-          rustc_json="$(rustc -vV | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
-          cargo_json="$(cargo -V | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))')"
-          python3 - "$receipt" "$extracted" <<PY
+          voice_ldd_file="$RUNNER_TEMP/voice-host.ldd"
+          rustc_file="$RUNNER_TEMP/rustc-vv.txt"
+          cargo_file="$RUNNER_TEMP/cargo-v.txt"
+          printf '%s\n' "$voice_ldd" > "$voice_ldd_file"
+          rustc -vV > "$rustc_file"
+          cargo -V > "$cargo_file"
+          ARCHIVE_SHA="$archive_sha"
+          RUSTY_V8_ARCHIVE_SHA256="$(sha256sum "$RUSTY_V8_ARCHIVE" | awk '{print $1}')"
+          RUSTY_V8_BINDING_SHA256="$(sha256sum "$RUSTY_V8_SRC_BINDING_PATH" | awk '{print $1}')"
+          VOICE_TARGET="${TARGET%-musl}-gnu"
+          export ARCHIVE_SHA RUSTY_V8_ARCHIVE_SHA256 RUSTY_V8_BINDING_SHA256 VOICE_TARGET
+          python3 - "$receipt" "$extracted" "$rustc_file" "$cargo_file" "$voice_ldd_file" <<'PY'
           import hashlib
           import json
+          import os
+          import sys
           from pathlib import Path
-          root = Path("$extracted")
+
+          receipt_path, extracted_path, rustc_path, cargo_path, voice_ldd_path = map(Path, sys.argv[1:])
           files = {
-              path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
-              for path in sorted(root.rglob("*"))
+              path.relative_to(extracted_path).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in sorted(extracted_path.rglob("*"))
               if path.is_file()
           }
           receipt = {
               "schema": "codex-controlled-runtime-receipt-v1",
-              "repository": "$GITHUB_REPOSITORY",
-              "tag": "$GITHUB_REF_NAME",
-              "source_commit": "$SOURCE_COMMIT",
-              "source_tree": "$SOURCE_TREE",
-              "cargo_version": "${{ needs.quality-gate.outputs.version }}",
-              "target": "$TARGET",
-              "voice_target": "${TARGET%-musl}-gnu",
-              "runner_arch": "$RUNNER_ARCH",
-              "archive": "$ASSET",
-              "archive_sha256": "$archive_sha",
-              "rustc_vv": json.loads('$rustc_json'),
-              "cargo_v": json.loads('$cargo_json'),
-              "voice_host_ldd": json.loads('$voice_ldd_json'),
-              "rusty_v8_archive_sha256": "$(sha256sum "$RUSTY_V8_ARCHIVE" | awk '{print $1}')",
-              "rusty_v8_binding_sha256": "$(sha256sum "$RUSTY_V8_SRC_BINDING_PATH" | awk '{print $1}')",
-              "qualification_workflow": "$GITHUB_WORKFLOW",
-              "qualification_run_id": "$GITHUB_RUN_ID",
-              "qualification_run_attempt": "$GITHUB_RUN_ATTEMPT",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "tag": os.environ["GITHUB_REF_NAME"],
+              "source_commit": os.environ["SOURCE_COMMIT"],
+              "source_tree": os.environ["SOURCE_TREE"],
+              "cargo_version": os.environ["CARGO_VERSION"],
+              "target": os.environ["TARGET"],
+              "voice_target": os.environ["VOICE_TARGET"],
+              "runner_arch": os.environ["RUNNER_ARCH"],
+              "archive": os.environ["ASSET"],
+              "archive_sha256": os.environ["ARCHIVE_SHA"],
+              "rustc_vv": rustc_path.read_text(),
+              "cargo_v": cargo_path.read_text().strip(),
+              "voice_host_ldd": voice_ldd_path.read_text(),
+              "rusty_v8_archive_sha256": os.environ["RUSTY_V8_ARCHIVE_SHA256"],
+              "rusty_v8_binding_sha256": os.environ["RUSTY_V8_BINDING_SHA256"],
+              "qualification_workflow": os.environ["GITHUB_WORKFLOW"],
+              "qualification_run_id": os.environ["GITHUB_RUN_ID"],
+              "qualification_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
               "files_sha256": files,
           }
-          Path("$receipt").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+          receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
           PY
           jq -e             --arg commit "$SOURCE_COMMIT"             --arg target "$TARGET"             --arg sha "$archive_sha"             '.source_commit == $commit and .target == $target and .archive_sha256 == $sha'             "$receipt" >/dev/null
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
